@@ -1,5 +1,4 @@
 # Copyright 2024-2025 Arm Limited and/or its affiliates.
-# All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -18,6 +17,7 @@ from executorch.exir.dialects.edge._ops import EdgeOpOverload
 
 from executorch.exir.pass_base import ExportPass, PassResult
 from torch.fx import GraphModule
+
 from torch.library import impl, Library
 
 lib = Library("tosa", "DEF")
@@ -26,7 +26,10 @@ lib.define("_table(Tensor self) -> Tensor")
 
 @impl(lib, "_table")
 def _table_impl(*args, **kwargs):  # pyre-ignore
-    return args[0]
+    in_dtype = args[0].dtype
+    if in_dtype == torch.int8:
+        return args[0]
+    return args[0].to(dtype=torch.int32)
 
 
 class InsertTableOpsPass(ExportPass):
@@ -59,29 +62,89 @@ class InsertTableOpsPass(ExportPass):
         """
         self.exported_program.state_dict[buffer_name] = buffer
 
-    def generate_table_values(
+    def generate_8bit_table_values(
         self,
         torch_op: Callable[[torch.Tensor], torch.Tensor],
         in_quantargs: QuantArgs,
         out_quantargs: QuantArgs,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, int]:
+        """Compute LUT values for a INT8 TOSA.TABLE. Also returns 0 since no shifting is required after 8bit table.
+        The INT8 table is a simple 256 value 1-1 LUT.
+        """
+
         def f(x: torch.Tensor) -> torch.Tensor:
             x = in_quantargs.dequantize_value(x)
             x = torch_op(x)
             return out_quantargs.quantize_value(x)
 
-        input_dtype = in_quantargs.dtype
-        steps = in_quantargs.qmax - in_quantargs.qmin + 1
-        return f(
+        return (
+            f(
+                torch.linspace(
+                    start=in_quantargs.qmin,
+                    end=in_quantargs.qmax,
+                    steps=256,
+                    # use torch.int64 to avoid overflow when dequantizing (subtracting zp).
+                    # e.g. torch.tensor(-50, dtype=torch.int8) - 100 == torch.tensor(106, dtype=torch.int8)
+                    dtype=torch.int64,
+                )
+            ).to(dtype=torch.int8),
+            0,
+        )
+
+    def generate_16_bit_table_values(
+        self,
+        torch_op: Callable[[torch.Tensor], torch.Tensor],
+        in_quantargs: QuantArgs,
+        out_quantargs: QuantArgs,
+    ) -> tuple[torch.Tensor, int]:
+        """Compute LUT values for a INT16 TOSA.TABLE with 32 bit output (in practice 23 bit, see specification).
+        The output of the the table will have 7 fractional bits, which means the output will interpreted as
+        x128 times too large unless accounted for. Right shift the table values to fit
+        in 16 bits. Return a lshift of the right shift - 7 due to the fractional bits.
+        """
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            # Dont use the 7 LSBs
+            x = in_quantargs.dequantize_value((x & ~0x7F))
+            x = torch_op(x)
+            return out_quantargs.quantize_value(x)
+
+        lut_values = f(
             torch.linspace(
                 start=in_quantargs.qmin,
-                end=in_quantargs.qmax,
-                steps=steps,
+                end=in_quantargs.qmax + 1,
+                steps=513,
                 # use torch.int64 to avoid overflow when dequantizing (subtracting zp).
                 # e.g. torch.tensor(-50, dtype=torch.int8) - 100 == torch.tensor(106, dtype=torch.int8)
                 dtype=torch.int64,
             )
-        ).to(dtype=input_dtype)
+        )
+        # Calculate how much we need to shift table values to fit in 16 bits
+        # ceil(log2(max absolute table value)) + 1 bit for signedness - 16
+        # Note: for out_quantargs.dtype=torch.int16, rshift == 0.
+        rshift = int(torch.ceil(torch.log2(lut_values.abs().max()))) + 1 - 16
+        lut_values = lut_values >> rshift
+        return lut_values.to(dtype=torch.int16), rshift - 7
+
+    def generate_table_values(
+        self,
+        torch_op: Callable[[torch.Tensor], torch.Tensor],
+        in_quantargs: QuantArgs,
+        out_quantargs: QuantArgs,
+    ) -> tuple[torch.Tensor, int]:
+        match out_quantargs.dtype:
+            case torch.int8:
+                return self.generate_8bit_table_values(
+                    torch_op, in_quantargs, out_quantargs
+                )
+            case torch.int16 | torch.int32:
+                return self.generate_16_bit_table_values(
+                    torch_op, in_quantargs, out_quantargs
+                )
+            case _:
+                raise ValueError(
+                    f"Unsupported output dtype for table: {out_quantargs.dtype}"
+                )
 
     def call(self, graph_module: GraphModule) -> PassResult:
         modified = False
@@ -100,10 +163,12 @@ class InsertTableOpsPass(ExportPass):
                     op_target=torch.ops.tosa._table.default,
                     args=(node.args[0],),
                 )
+                output_node = table_node
                 assert len(input_qparams) == 1
                 assert len(output_qparams) == 1
-                # Generate table buffer
-                buffer = self.generate_table_values(
+
+                # Generate table buffer and how much to lshift the table output.
+                buffer, lshift = self.generate_table_values(
                     torch_op=self.table_ops[node.target],
                     in_quantargs=input_qparams[0],
                     out_quantargs=output_qparams[0],
@@ -114,10 +179,20 @@ class InsertTableOpsPass(ExportPass):
                 self.register_buffer(
                     buffer_name=table_node.name.replace("_default", ""), buffer=buffer
                 )
-                node.replace_all_uses_with(table_node)
+
+                if lshift != 0:
+                    scale = 2.0**lshift
+                    rescale_node = create_node(
+                        graph=graph_module.graph,
+                        op_target=torch.ops.tosa._rescale.default,
+                        args=(table_node, output_qparams[0].dtype, scale, 0, 0),
+                    )
+                    output_node = rescale_node
+
+                node.replace_all_uses_with(output_node)
             graph_module.graph.erase_node(node)
-            table_node.meta["input_qparams"] = input_qparams
-            table_node.meta["output_qparams"] = output_qparams
+            output_node.meta["input_qparams"] = input_qparams
+            output_node.meta["output_qparams"] = output_qparams
             modified = True
 
         if modified:
