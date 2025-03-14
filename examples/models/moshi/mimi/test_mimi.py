@@ -12,6 +12,20 @@ import torchaudio
 from huggingface_hub import hf_hub_download
 from moshi.models import loaders
 from torch.export import export, ExportedProgram
+from executorch.exir import to_edge_transform_and_lower
+from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
+from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import (
+    get_symmetric_quantization_config,
+    XNNPACKQuantizer,
+)
+from torch.ao.quantization.quantize_pt2e import (
+    _convert_to_reference_decomposed_fx,
+    convert_pt2e,
+    prepare_pt2e,
+    prepare_qat_pt2e,
+)
+
+from executorch.extension.export_util.utils import save_pte_program
 
 
 def read_mp3_from_url(url):
@@ -130,6 +144,35 @@ class TestMimiModel(unittest.TestCase):
         exported_decode: ExportedProgram = export(mimi_decode, (input,), strict=False)
         ep_decode_output = exported_decode.module()(input)
         self.assertTrue(torch.allclose(ep_decode_output, ref_decode_output, atol=1e-6))
+
+        # uncomment below for pt2e quantized model
+        # # PT2E Quantization
+        # quantizer = XNNPACKQuantizer()
+        # # 8 bit by default
+        # quantization_config = get_symmetric_quantization_config(
+        #     is_per_channel=True,
+        #     is_dynamic=True,
+        # )
+        # quantizer.set_global(quantization_config)
+        # m = exported_decode.module()
+        # m = prepare_pt2e(m, quantizer)
+        # m(input)
+        # m = convert_pt2e(m)
+        # print("quantized graph:")
+        # print(m.graph)
+        # # Export quantized module
+        # exported_decode: ExportedProgram = export(m, (input,), strict=False)
+
+        # Lower
+        edge_manager = to_edge_transform_and_lower(
+            exported_decode,
+            partitioner=[XnnpackPartitioner()],
+        )
+
+        exec_prog = edge_manager.to_executorch()
+        print("exec graph:")
+        print(exec_prog.exported_program().graph)
+        save_pte_program(exec_prog, "/tmp/Mimi_decode_fp.pte")
 
     def test_exported_encoding(self):
         """Ensure exported encoding model is consistent with reference output."""
