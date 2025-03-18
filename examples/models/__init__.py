@@ -44,6 +44,7 @@ class Model(str, Enum):
 
 class Backend(str, Enum):
     XnnpackQuantizationDelegation = "xnnpack-quantization-delegation"
+    CoreMl = "coreml"
 
     def __str__(self) -> str:
         return self.value

@@ -210,8 +210,8 @@ test_model_with_qnn() {
 }
 
 test_model_with_coreml() {
-  if [[ "${BUILD_TOOL}" == "buck2" ]]; then
-    echo "coreml doesn't support buck2."
+  if [[ "${BUILD_TOOL}" != "cmake" ]]; then
+    echo "coreml only supports cmake."
     exit 1
   fi
 
@@ -229,6 +229,11 @@ test_model_with_coreml() {
     echo "No .pte file found"
     exit 1
   fi
+
+  # Run the model
+  examples/apple/coreml/scripts/build_executor_runner.sh
+  ./coreml_executor_runner --model_path "${EXPORTED_MODEL}"
+  rm coreml_executor_runner
 }
 
 test_model_with_mps() {
