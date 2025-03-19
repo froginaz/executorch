@@ -56,9 +56,9 @@ from .source_transformation.apply_spin_quant_r1_r2 import (
 
 from .source_transformation.attention import replace_attention_to_attention_sha
 from .source_transformation.quantize import (
-    set_quantized_computation_dtype,
     get_quant_embedding_transform,
     get_quant_weight_transform,
+    set_quantized_computation_dtype,
 )
 from .source_transformation.quantized_kv_cache import (
     replace_kv_cache_with_custom_kv_cache,
@@ -596,30 +596,23 @@ def _prepare_for_llama_export(args) -> LLMEdgeManager:
 
     # At this point, the model is loaded in the default fp32.
 
-    # Convert the non-weights of the model (the buffers) to the dtype_override.
-    # Need to do this before source transform quantization since the quantized
-    # parameters become buffers.
-    for buf in edge_manager.model.buffers():
-        buf.data = buf.data.to(dtype=dtype_override.to_torch_dtype())
+    # TODO: some validation for the combination of checkpoint dtype and dtype_override.
+
+    edge_manager.model = edge_manager.model.to(dtype=dtype_override.to_torch_dtype())
 
     # We want to quantize (in the source transforms) the weights of the model
     # in the checkpoint dtype.
     logging.info(f"Checkpoint dtype: {edge_manager.model.checkpoint_dtype}")
     edge_manager = edge_manager.set_output_dir(output_dir_path).source_transform(
         _get_source_transforms(
-            args.model,
-            dtype_override,
-            DType.from_torch_dtype(edge_manager.model.checkpoint_dtype),
-            args,
+            modelname=args.model,
+            dtype_override=dtype_override,
+            checkpoint_dtype=DType.from_torch_dtype(
+                edge_manager.model.checkpoint_dtype
+            ),
+            args=args,
         )
     )
-
-    # Convert the parameters to the dtype_override.
-    # If source transform quantization has already happened at this point (-qmode),
-    # the quantized weights will become buffers and not be returned by .parameters(),
-    # so we don't convert them to the dtype_override.
-    for param in edge_manager.model.parameters():
-        param.data = param.data.to(dtype=dtype_override.to_torch_dtype())
 
     return edge_manager
 

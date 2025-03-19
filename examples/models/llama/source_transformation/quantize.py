@@ -845,9 +845,7 @@ def _load_torchao_aten_lib(libname):
 # We want to do compute the actual ops in the dtype of the dtype_override,
 # since the precision of the quantized linear will initially be the dtype of the
 # checkpoint, not the dtype_override.
-def set_quantized_computation_dtype(
-    module: nn.Module, dtype: torch.dtype
-) -> nn.Module:
+def set_quantized_computation_dtype(module: nn.Module, dtype: torch.dtype) -> nn.Module:
     def _set_quantized_computation_dtype_rec(
         module: nn.Module, dtype: torch.dtype
     ) -> None:
