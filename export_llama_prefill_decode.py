@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Export a Llama model with dynamic shapes for parallel prefill + single-token decode.
+"""Export a Llama model with separate kv_forward (prefill) and decode methods.
 
-Exports a single 'forward' method that accepts 1 to max_seq_len tokens, enabling
-both parallel prefill (all prompt tokens at once) and sequential decode (one token).
+Exports two methods in a single .pte file:
+  - kv_forward: accepts 1..max_seq_len tokens (dynamic shapes) for parallel prefill
+  - decode: accepts exactly 1 token for autoregressive generation
+
+Both methods share the same KV cache buffers via share_mutable_buffers=True in the
+memory planning pass, so state written by kv_forward is visible to decode at runtime.
+
 Uses enable_dynamic_shape=False in the model (simpler rope path) while passing
-dynamic_shapes to torch.export for runtime flexibility.
+dynamic_shapes to torch.export for kv_forward's runtime flexibility.
 """
 
 import logging
@@ -40,8 +45,8 @@ def main():
 
     builder = _prepare_for_llama_export(llm_config)
 
-    # Export single method with dynamic sequence length (1 to max_seq_len).
-    logging.info("Exporting forward with dynamic seq up to %d...", max_seq_len)
+    # --- Export kv_forward with dynamic sequence length (1..max_seq_len) ---
+    logging.info("Exporting kv_forward with dynamic seq up to %d...", max_seq_len)
     seq_dim = Dim("seq", min=1, max=max_seq_len)
     builder.example_inputs = (
         torch.arange(1, max_seq_len + 1, dtype=torch.long).unsqueeze(0),
@@ -51,19 +56,27 @@ def main():
         {1: seq_dim},
         {"input_pos": {0: seq_dim}},
     )
-    forward_prog = builder._export()
+    kv_forward_prog = builder._export()
 
-    # Override metadata: the model was exported with dynamic shapes, so
-    # enable_dynamic_shape should be True for parallel prefill at runtime.
+    # --- Export decode with fixed single-token shape ---
+    logging.info("Exporting decode with seq_len=1...")
+    builder.example_inputs = (
+        torch.tensor([[1]], dtype=torch.long),
+        {"input_pos": torch.tensor([0], dtype=torch.long)},
+    )
+    builder.dynamic_shapes = None
+    decode_prog = builder._export()
+
+    # enable_dynamic_shape=True tells the C++ runner to use parallel prefill.
     builder.metadata["enable_dynamic_shape"] = True
 
-    # Lower and convert to ExecuTorch program.
+    # --- Lower both methods together ---
     logging.info("Lowering...")
     partitioners = _get_xnnpack_partitioners(llm_config)
     edge_config = builder._get_edge_config()
 
     edge_manager = to_edge_transform_and_lower(
-        forward_prog,
+        {"kv_forward": kv_forward_prog, "decode": decode_prog},
         partitioner=partitioners,
         compile_config=edge_config,
         constant_methods=builder.metadata,
@@ -76,7 +89,10 @@ def main():
             extract_delegate_segments=True,
             passes=[],
             do_quant_fusion_and_const_prop=True,
-            memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False),
+            memory_planning_pass=MemoryPlanningPass(
+                alloc_graph_input=False,
+                share_mutable_buffers=True,
+            ),
             sym_shape_eval_pass=ConstraintBasedSymShapeEvalPass(),
         )
     )
@@ -88,7 +104,7 @@ def main():
         builder.dtype,
     )
     if output_file.endswith(".pte"):
-        output_file = output_file[:-4] + "_dynamic.pte"
+        output_file = output_file[:-4] + "_prefill_decode.pte"
 
     save_pte_program(export_program, output_file, builder.output_dir)
     logging.info(f"Saved to {output_file}")
