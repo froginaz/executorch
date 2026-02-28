@@ -24,6 +24,7 @@
 #include <executorch/extension/llm/runner/text_prefiller.h>
 #include <executorch/extension/llm/runner/text_token_generator.h>
 #include <executorch/extension/module/module.h>
+#include <executorch/runtime/core/hierarchical_allocator.h>
 #include <pytorch/tokenizers/tokenizer.h>
 // Helper functions are now in llm_runner_helper.h
 // These are provided for backward compatibility
@@ -33,6 +34,12 @@ namespace executorch::extension::llm {
 
 class ET_EXPERIMENTAL TextLLMRunner : public IRunner {
  public:
+  struct SharedMethodMemory {
+    std::vector<std::vector<uint8_t>> buffers;
+    std::vector<runtime::Span<uint8_t>> spans;
+    std::unique_ptr<runtime::HierarchicalAllocator> allocator;
+  };
+
   /**
    * @brief Constructor for TextLLMRunner with dependency injection
    *
@@ -63,7 +70,9 @@ class ET_EXPERIMENTAL TextLLMRunner : public IRunner {
       std::unique_ptr<IOManager> io_manager,
       std::unique_ptr<TextTokenGenerator> text_token_generator,
       std::unique_ptr<Stats> stats,
-      float temperature = -1.0f);
+      float temperature = -1.0f,
+      std::unique_ptr<TextDecoderRunner> text_prefill_runner = nullptr,
+      std::unique_ptr<SharedMethodMemory> shared_method_memory = nullptr);
 
   /**
    * @brief Checks if the model is loaded and ready for inference
@@ -163,6 +172,10 @@ class ET_EXPERIMENTAL TextLLMRunner : public IRunner {
  private:
   bool shouldStop_{false};
 
+  // Shared planned memory for multi-method KV cache sharing.
+  // Must be declared before module_ so it outlives loaded methods.
+  std::unique_ptr<SharedMethodMemory> shared_method_memory_;
+
   // Components
   std::unique_ptr<::tokenizers::Tokenizer> tokenizer_;
   std::unordered_map<std::string, int64_t> metadata_;
@@ -173,6 +186,8 @@ class ET_EXPERIMENTAL TextLLMRunner : public IRunner {
       text_decoder_runner_; // Manage text_decoder_runner_'s lifecycle, make
                             // sure it outlives text_prefiller_ &
                             // text_token_generator_.
+  std::unique_ptr<TextDecoderRunner>
+      text_prefill_runner_; // Optional separate runner for prefill method.
   std::unique_ptr<TextPrefiller> text_prefiller_;
   std::unique_ptr<IOManager> io_manager_;
   std::unique_ptr<TextTokenGenerator> text_token_generator_;
