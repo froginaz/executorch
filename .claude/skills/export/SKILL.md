@@ -31,3 +31,4 @@ with open("model.pte", "wb") as f:
 - [torch.export basics](guides/torch-export.md) — `torch.export.export()`, dynamic shapes, strict mode, debugging
 - [Multi-method .pte](guides/build_multi_method.md) — Two-method prefill/decode split with shared KV cache
 - [enable_dynamic_shape](guides/what_is_dynamic_shape.md) — What the flag controls across model, export, and runtime
+- [Generate llama3_prefill_decode.pte](guides/how_to_generate_llama3_prefill_decode_pte.md) — End-to-end export and run with two methods
