@@ -29,3 +29,5 @@ with open("model.pte", "wb") as f:
 
 ## Guides
 - [torch.export basics](guides/torch-export.md) — `torch.export.export()`, dynamic shapes, strict mode, debugging
+- [Multi-method .pte](guides/build_multi_method.md) — Two-method prefill/decode split with shared KV cache
+- [enable_dynamic_shape](guides/what_is_dynamic_shape.md) — What the flag controls across model, export, and runtime
