@@ -6,6 +6,7 @@ cd "$SCRIPT_DIR"
 
 BUILD_TYPE="${1:-Release}"
 NPROC=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
 
 echo "=== Building ExecuTorch LLM libraries (${BUILD_TYPE}) ==="
 # Clean previously installed headers so --fresh configure produces consistent
