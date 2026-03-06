@@ -16,8 +16,13 @@
  * files. And Enn backends is going to inference, and output results.
  */
 
+#ifdef __ANDROID__
 #include <executorch/backends/samsung/runtime/enn_executor.h>
 #include <executorch/backends/samsung/runtime/profile.hpp>
+#else
+#define EXYNOS_ATRACE_BEGIN(name)
+#define EXYNOS_ATRACE_END()
+#endif
 #include <executorch/extension/data_loader/file_data_loader.h>
 #include <executorch/extension/evalue_util/print_evalue.h>
 #include <executorch/extension/runner_util/inputs.h>
@@ -46,7 +51,9 @@ DEFINE_string(output_path, "", "Output Execution results to target directory.");
 
 using namespace torch::executor;
 using torch::executor::util::FileDataLoader;
+#ifdef __ANDROID__
 using namespace torch::executor::enn;
+#endif
 
 std::vector<std::string> split(std::string str, char delimiter = ' ') {
   std::vector<std::string> result;
@@ -118,6 +125,7 @@ void saveOutput(const exec_aten::Tensor& tensor, int32_t output_index) {
   fout.close();
 }
 
+#ifdef __ANDROID__
 struct EnnApiDeinit {
   void operator()(EnnApi* ptr) const {
     if (ptr == nullptr) {
@@ -135,10 +143,13 @@ std::unique_ptr<EnnApi, EnnApiDeinit> exynos_npu_init() {
   ET_CHECK_MSG(ret == ENN_RET_SUCCESS, "Enn initialize failed.");
   return std::unique_ptr<EnnApi, EnnApiDeinit>(enn_api_inst);
 }
+#endif
 
 int main(int argc, char** argv) {
   auto before_init = std::chrono::high_resolution_clock::now();
+#ifdef __ANDROID__
   std::unique_ptr<EnnApi, EnnApiDeinit> instance = exynos_npu_init();
+#endif
   auto after_init = std::chrono::high_resolution_clock::now();
   double interval_init = std::chrono::duration_cast<std::chrono::microseconds>(
                              after_init - before_init)

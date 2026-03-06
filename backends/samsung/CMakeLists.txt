@@ -169,6 +169,36 @@ if(${ANDROID})
     EXPORT ExecuTorchTargets
     DESTINATION ${CMAKE_INSTALL_LIBDIR}
   )
+else()
+  # x86 build: enn_executor_runner with XNNPACK backend instead of ENN backend
+  set(__enn_executor_runner_srcs
+      ${EXECUTORCH_SOURCE_DIR}/examples/samsung/executor_runner/enn_executor_runner.cpp
+  )
+  add_executable(enn_executor_runner ${__enn_executor_runner_srcs})
+
+  set(_xnnpack_runner_libs)
+  if(TARGET xnnpack_backend)
+    list(APPEND _xnnpack_runner_libs xnnpack_backend XNNPACK
+         xnnpack-microkernels-prod
+    )
+    if(TARGET kleidiai)
+      list(APPEND _xnnpack_runner_libs kleidiai)
+    endif()
+    executorch_target_link_options_shared_lib(xnnpack_backend)
+  endif()
+
+  target_link_libraries(
+    enn_executor_runner
+    PRIVATE enn_logging
+            ${_xnnpack_runner_libs}
+            gflags
+            executorch
+            extension_data_loader
+            portable_ops_lib
+  )
+  set_target_properties(
+    enn_executor_runner PROPERTIES CXX_VISIBILITY_PRESET hidden
+  )
 endif()
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/runtime)
