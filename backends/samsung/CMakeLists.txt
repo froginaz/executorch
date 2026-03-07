@@ -170,6 +170,37 @@ if(ANDROID OR EXECUTORCH_BUILD_ENN_BACKEND)
   set_target_properties(
     enn_executor_runner PROPERTIES CXX_VISIBILITY_PRESET hidden
   )
+
+  add_executable(
+    enn_executor_llama_runner
+    ${EXECUTORCH_SOURCE_DIR}/examples/samsung/executor_runner/enn_executor_llama_runner.cpp
+  )
+  target_link_libraries(
+    enn_executor_llama_runner
+    PRIVATE enn_logging
+            enn_backend
+            gflags
+            executorch
+            extension_data_loader
+            extension_module
+            extension_tensor
+            portable_ops_lib
+            extension_llm_runner
+  )
+  if(TARGET xnnpack_backend)
+    target_link_libraries(
+      enn_executor_llama_runner
+      PRIVATE xnnpack_backend XNNPACK xnnpack-microkernels-prod
+    )
+    if(TARGET kleidiai)
+      target_link_libraries(enn_executor_llama_runner PRIVATE kleidiai)
+    endif()
+    executorch_target_link_options_shared_lib(xnnpack_backend)
+  endif()
+  set_target_properties(
+    enn_executor_llama_runner PROPERTIES CXX_VISIBILITY_PRESET hidden
+  )
+
   install(
     TARGETS enn_backend enn_logging
     EXPORT ExecuTorchTargets
