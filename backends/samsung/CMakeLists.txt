@@ -157,6 +157,16 @@ if(ANDROID OR EXECUTORCH_BUILD_ENN_BACKEND)
             extension_data_loader
             portable_ops_lib
   )
+  if(TARGET xnnpack_backend)
+    target_link_libraries(
+      enn_executor_runner
+      PRIVATE xnnpack_backend XNNPACK xnnpack-microkernels-prod
+    )
+    if(TARGET kleidiai)
+      target_link_libraries(enn_executor_runner PRIVATE kleidiai)
+    endif()
+    executorch_target_link_options_shared_lib(xnnpack_backend)
+  endif()
   set_target_properties(
     enn_executor_runner PROPERTIES CXX_VISIBILITY_PRESET hidden
   )
