@@ -60,6 +60,7 @@ function build_x86_64() {
 function build_android() {
   cmake \
         -DCMAKE_INSTALL_PREFIX=${ANDROID_BUILD_DIR} \
+        -DCMAKE_BUILD_TYPE=Release \
         -DEXECUTORCH_BUILD_ENN=ON \
         -DEXECUTORCH_BUILD_ENN_BACKEND=ON \
         -DEXECUTORCH_BUILD_XNNPACK=ON \
