@@ -11,7 +11,7 @@ target_sources(
   PRIVATE ${CMAKE_CURRENT_LIST_DIR}/logging.cpp
 )
 
-if(${ANDROID})
+if(ANDROID OR EXECUTORCH_BUILD_ENN_BACKEND)
   # backend
   target_sources(
     enn_backend

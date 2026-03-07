@@ -14,8 +14,8 @@ get_filename_component(
 
 if(NOT DEFINED EXYNOS_AI_LITECORE_ROOT)
   message(
-    FATAL_ERROR
-      "Please define EXYNOS_AI_LIRECORE_PATH by adding cmake parameter -DEXYNOS_AI_LITECORE_ROOT=<...>"
+    WARNING
+      "EXYNOS_AI_LITECORE_ROOT not set. Pybind11 and AOT targets will not be built."
   )
 endif()
 if(CMAKE_TOOLCHAIN_FILE MATCHES ".*(iOS|ios\.toolchain)\.cmake$")
@@ -39,13 +39,11 @@ endif()
 include_directories(
   ${EXECUTORCH_SOURCE_DIR}/..
   ${EXECUTORCH_SOURCE_DIR}/runtime/core/portable_type/c10
-  ${EXYNOS_AI_LITECORE_ROOT}
 )
-add_compile_definitions(C10_USING_CUSTOM_GENERATED_MACROS)
-
-if(${ANDROID})
-  find_library(android_log log)
+if(DEFINED EXYNOS_AI_LITECORE_ROOT)
+  include_directories(${EXYNOS_AI_LITECORE_ROOT})
 endif()
+add_compile_definitions(C10_USING_CUSTOM_GENERATED_MACROS)
 
 # add logging library
 add_library(enn_logging STATIC)
@@ -139,8 +137,7 @@ if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86_64")
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/aot)
 endif()
 
-if(${ANDROID})
-  target_link_libraries(enn_logging PRIVATE ${android_log})
+if(ANDROID OR EXECUTORCH_BUILD_ENN_BACKEND)
   add_library(enn_backend STATIC)
   target_link_libraries(enn_backend PRIVATE enn_logging extension_runner_util)
   executorch_target_link_options_shared_lib(enn_backend)
@@ -159,7 +156,6 @@ if(${ANDROID})
             executorch
             extension_data_loader
             portable_ops_lib
-            android
   )
   set_target_properties(
     enn_executor_runner PROPERTIES CXX_VISIBILITY_PRESET hidden

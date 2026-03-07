@@ -120,7 +120,7 @@ void saveOutput(const exec_aten::Tensor& tensor, int32_t output_index) {
 
 struct EnnApiDeinit {
   void operator()(EnnApi* ptr) const {
-    if (ptr == nullptr) {
+    if (ptr == nullptr || ptr->EnnDeinitialize == nullptr) {
       return;
     }
 
@@ -131,6 +131,10 @@ struct EnnApiDeinit {
 
 std::unique_ptr<EnnApi, EnnApiDeinit> exynos_npu_init() {
   EnnApi* enn_api_inst = EnnApi::getEnnApiInstance();
+  if (enn_api_inst->EnnInitialize == nullptr) {
+    ET_LOG(Info, "ENN API library not available. Skipping NPU initialization.");
+    return std::unique_ptr<EnnApi, EnnApiDeinit>(nullptr);
+  }
   auto ret = enn_api_inst->EnnInitialize();
   ET_CHECK_MSG(ret == ENN_RET_SUCCESS, "Enn initialize failed.");
   return std::unique_ptr<EnnApi, EnnApiDeinit>(enn_api_inst);

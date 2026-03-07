@@ -58,23 +58,10 @@ function build_x86_64() {
 }
 
 function build_android() {
-  if [[ -z ${ANDROID_NDK_ROOT} ]]; then
-    echo "Please export ANDROID_NDK_ROOT or set by command"
-    exit 1
-  fi
-
-  ANDROID_ABI=arm64-v8a
-  ANDROID_PLATFORM=android-28 # Trace requires over android-23
-
   cmake \
         -DCMAKE_INSTALL_PREFIX=${ANDROID_BUILD_DIR} \
-        -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake" \
-        -DANDROID_NDK=${ANDROID_NDK} \
-        -DANDROID_ABI="${ANDROID_ABI}" \
-        -DANDROID_PLATFORM=${ANDROID_PLATFORM} \
-        -DCMAKE_BUILD_TYPE=Release \
         -DEXECUTORCH_BUILD_ENN=ON \
-        -DEXYNOS_AI_LITECORE_ROOT=${EXYNOS_AI_LITECORE_ROOT} \
+        -DEXECUTORCH_BUILD_ENN_BACKEND=ON \
         -DEXECUTORCH_BUILD_EXTENSION_MODULE=ON \
         -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON \
 	      -DEXECUTORCH_BUILD_EXTENSION_FLAT_TENSOR=ON \
