@@ -194,6 +194,7 @@ else()
             gflags
             executorch
             extension_data_loader
+            extension_runner_util
             portable_ops_lib
   )
   set_target_properties(
