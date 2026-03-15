@@ -68,6 +68,7 @@ class ModelArgs:
     act_fn: ActFn = dataclasses.field(default=ActFn.SILU)  # Activation function type
     attention_qkv_bias: bool = False
     use_kv_cache: bool = False  # Use key/value cache
+    runner_managed_cache: bool = False  # KV cache updated by runner, not model
     use_sdpa_with_kv_cache_op: bool = (
         False  # Use custom sdpa op that updates kv cache in-place
     )

@@ -13,6 +13,7 @@
 #include <executorch/extension/llm/runner/multimodal_decoder_runner.h>
 #include <executorch/extension/llm/runner/multimodal_prefiller.h>
 #include <executorch/extension/llm/runner/multimodal_runner.h>
+#include <executorch/extension/llm/runner/io_manager/runner_managed_cache_io_manager.h>
 #include <executorch/extension/llm/runner/stats.h>
 #include <executorch/extension/llm/runner/text_llm_runner.h>
 #include <executorch/extension/llm/runner/text_prefiller.h>
@@ -96,6 +97,7 @@ get_llm_metadata(tokenizers::Tokenizer* tokenizer, Module* module) {
       {llm::kMaxContextLen, 128},
       {llm::kUseKVCache, true},
       {llm::kUseSDPAWithKVCache, false},
+      {llm::kRunnerManagedCache, false},
   });
 
   // Read metadata from the model
@@ -248,12 +250,45 @@ std::unique_ptr<TextLLMRunner> create_text_llm_runner(
       llm::get_eos_ids(tokenizer.get(), module.get()));
 
   // Create IOManager
-  std::unique_ptr<IOManager> io_manager = std::make_unique<IOManager>(*module);
+  std::unique_ptr<IOManager> io_manager;
+  if (metadata.at(kRunnerManagedCache)) {
+    // Runner-managed cache: the model outputs K/V projections, the runner
+    // writes them into the cache. No shared mutable buffers needed.
+    auto n_layers = metadata.at(kMaxContextLen);  // placeholder; see below
+    // We need n_layers, n_kv_heads, head_dim from the decode method's input
+    // metadata. The k_cache input (index 2) has shape
+    // (n_layers, 1, n_kv_heads, max_seq_len, head_dim).
+    auto decode_method_name = method_name;
+    auto dm = module->method_meta(decode_method_name);
+    if (dm.ok() && dm->num_inputs() >= 4) {
+      auto k_meta = dm->input_tensor_meta(2);
+      if (k_meta.ok()) {
+        auto sizes = k_meta->sizes();
+        // sizes: [n_layers, batch, n_kv_heads, max_seq_len, head_dim]
+        n_layers = sizes[0];
+        auto n_kv_heads = sizes[2];
+        auto max_seq = sizes[3];
+        auto head_dim = sizes[4];
+        auto dtype = k_meta->scalar_type();
+        io_manager = std::make_unique<RunnerManagedCacheIOManager>(
+            *module, n_layers, n_kv_heads, max_seq, head_dim, dtype);
+      }
+    }
+    if (!io_manager) {
+      ET_LOG(Error,
+             "runner_managed_cache set but could not read k_cache metadata "
+             "from decode method. Falling back to default IOManager.");
+      io_manager = std::make_unique<IOManager>(*module);
+    }
+  } else {
+    io_manager = std::make_unique<IOManager>(*module);
+  }
 
-  // When using separate prefill/decode methods, pre-load both with shared
-  // planned memory so they share the same KV cache buffers.
+  // When using separate prefill/decode methods with model-managed cache,
+  // pre-load both with shared planned memory so they share the same KV cache
+  // buffers. Runner-managed cache doesn't need shared buffers.
   std::unique_ptr<TextLLMRunner::SharedMethodMemory> shared_method_memory;
-  if (!prefill_method_name.empty()) {
+  if (!prefill_method_name.empty() && !metadata.at(kRunnerManagedCache)) {
     ET_LOG(
         Info,
         "Pre-loading methods with shared memory: %s, %s",

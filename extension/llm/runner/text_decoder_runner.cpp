@@ -72,13 +72,13 @@ TextDecoderRunner::TextDecoderRunner(
     ET_CHECK_OK_OR_RETURN_ERROR(update_err);
 
     ET_CHECK_MSG(
-        outputs_res.get().size() == 1,
-        "More than one output returned from executing LLM.");
+        outputs_res.get().size() >= 1,
+        "No output returned from executing LLM.");
     ET_CHECK_MSG(
         outputs_res.get()[0].isTensor(),
         "Non Tensor Output returned from executing LLM");
 
-    // Return the logits tensor
+    // Return the logits tensor (first output).
     return outputs_res.get()[0].toTensor();
   } else { // no kv cache
     (void)start_pos; // unused
@@ -87,8 +87,8 @@ TextDecoderRunner::TextDecoderRunner(
     auto outputs_res = module_->execute(method_name_, inputs);
     ET_CHECK_OK_OR_RETURN_ERROR(outputs_res.error());
     ET_CHECK_MSG(
-        outputs_res.get().size() == 1,
-        "More than one output returned from executing LLM.");
+        outputs_res.get().size() >= 1,
+        "No output returned from executing LLM.");
     ET_CHECK_MSG(
         outputs_res.get()[0].isTensor(),
         "Non Tensor Output returned from executing LLM");

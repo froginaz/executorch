@@ -348,6 +348,7 @@ class AttentionMHA(Attention):
         self.use_qk_norm = args.use_qk_norm
         self.qk_norm_before_rope = args.qk_norm_before_rope
         self.enable_dynamic_shape = args.enable_dynamic_shape
+        self.runner_managed_cache = getattr(args, "runner_managed_cache", False)
 
         if self.use_qk_norm:
             q_norm_dim = self.head_dim
@@ -428,13 +429,14 @@ class AttentionMHA(Attention):
         self.register_buffer("mask", causal_mask, persistent=False)
 
         if self.use_kv_cache:
-            self.kv_cache = KVCache(
-                args.max_batch_size,
-                args.max_context_len,
-                self.n_kv_heads,
-                self.head_dim,
-                args.enable_dynamic_shape,
-            )
+            if not self.runner_managed_cache:
+                self.kv_cache = KVCache(
+                    args.max_batch_size,
+                    args.max_context_len,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    args.enable_dynamic_shape,
+                )
             self.SDPA = SDPA(
                 dim=self.n_local_heads * self.head_dim,
                 head_dim=self.head_dim,
@@ -476,6 +478,22 @@ class AttentionMHA(Attention):
 
         if self.use_kv_cache:
             assert input_pos is not None
+
+            if self.runner_managed_cache:
+                new_k, new_v = k, v
+                k_cache_ext = kwargs.get("k_cache")
+                if k_cache_ext is not None:
+                    layer_k = k_cache_ext[self.layer_id]
+                    layer_v = kwargs["v_cache"][self.layer_id]
+                    indices = input_pos.reshape(1, 1, -1, 1).expand_as(k)
+                    k = layer_k.scatter(2, indices, k)
+                    v = layer_v.scatter(2, indices, v)
+                    attn_mask = self.mask[input_pos]
+                else:
+                    attn_mask = self.mask[input_pos][:, input_pos]
+                output = self.SDPA(input_pos, q, k, v, bsz, seqlen, attn_mask)
+                return self.wo(output), {"new_k": new_k, "new_v": new_v}
+
             if self.enable_dynamic_shape:
                 start_pos = input_pos[-1].item()
                 torch._check_is_size(start_pos)

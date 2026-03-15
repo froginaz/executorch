@@ -171,6 +171,7 @@ class Transformer(nn.Module):
             else None
         )
         self.use_kv_cache = params.use_kv_cache
+        self.runner_managed_cache = getattr(params, "runner_managed_cache", False)
         self.generate_full_logits = params.generate_full_logits
         self.max_seq_len = params.max_seq_len
         self.max_context_len = params.max_context_len
@@ -200,9 +201,15 @@ class Transformer(nn.Module):
         # Make a shallow copy so the updates don't get captured by export
         attn_options_ = attn_options.copy() if attn_options is not None else {}
         attn_options_update = None
+        new_kvs_k = []
+        new_kvs_v = []
         for layer in self.layers:
             h, attn_options_update = layer(h, freqs_cos, freqs_sin, attn_options_)
-            if attn_options_update is not None:
+            if self.runner_managed_cache:
+                if attn_options_update is not None and "new_k" in attn_options_update:
+                    new_kvs_k.append(attn_options_update["new_k"])
+                    new_kvs_v.append(attn_options_update["new_v"])
+            elif attn_options_update is not None:
                 attn_options_.update(**attn_options_update)
 
         if not self.generate_full_logits:
@@ -238,6 +245,11 @@ class Transformer(nn.Module):
                 logits = expanded_logits
         else:
             logits = h
+
+        if self.runner_managed_cache and new_kvs_k:
+            all_k = torch.stack(new_kvs_k)
+            all_v = torch.stack(new_kvs_v)
+            return logits, all_k, all_v
 
         if attn_options_update is not None:
             return logits, attn_options_update
