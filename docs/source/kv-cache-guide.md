@@ -263,7 +263,122 @@ decode_method->execute();    // Reads cache, writes at [prompt_len+1]
 // ... continues autoregressively
 ```
 
-## 10. Memory Size Calculation
+## 10. Exporting a Prefill/Decode Model with Shared KV-Cache
+
+### Step 1: Export Two Methods with Different Shapes
+
+```python
+import torch
+from torch.export import Dim, export
+
+model = MyLlamaModel(use_kv_cache=True).eval()
+max_seq_len = 2048
+
+# --- Prefill: dynamic sequence length [1..max_seq_len] ---
+seq_dim = Dim("seq", min=1, max=max_seq_len)
+
+prefill_inputs = (
+    torch.arange(1, max_seq_len + 1, dtype=torch.long).unsqueeze(0),  # [1, S]
+    torch.arange(0, max_seq_len, dtype=torch.long),                    # input_pos [S]
+)
+prefill_dynamic_shapes = (
+    {1: seq_dim},           # tokens dim 1 is dynamic
+    {0: seq_dim},           # input_pos dim 0 is dynamic
+)
+prefill_prog = export(model, prefill_inputs, dynamic_shapes=prefill_dynamic_shapes)
+
+# --- Decode: fixed single token ---
+decode_inputs = (
+    torch.tensor([[1]], dtype=torch.long),     # [1, 1]
+    torch.tensor([0], dtype=torch.long),       # input_pos [1]
+)
+decode_prog = export(model, decode_inputs)     # No dynamic shapes
+```
+
+### Step 2: Lower Both Methods Together
+
+```python
+from executorch.exir import to_edge_transform_and_lower
+
+edge_manager = to_edge_transform_and_lower(
+    {"kv_forward": prefill_prog, "decode": decode_prog},
+    compile_config=edge_config,
+    partitioner=partitioners,       # e.g., XnnpackPartitioner
+    constant_methods={
+        "get_max_seq_len": max_seq_len,
+        "use_kv_cache": True,
+        "enable_dynamic_shape": True,
+    },
+)
+```
+
+`constant_methods` adds lightweight methods to the PTE that return config values at runtime.
+
+### Step 3: Serialize with Shared Mutable Buffers
+
+```python
+from executorch.exir.capture._config import ExecutorchBackendConfig
+from executorch.exir.passes import MemoryPlanningPass
+from executorch.exir.passes.init_mutable_pass import InitializedMutableBufferPass
+from executorch.exir.passes.sym_shape_eval_pass import ConstraintBasedSymShapeEvalPass
+
+export_program = edge_manager.to_executorch(
+    ExecutorchBackendConfig(
+        memory_planning_pass=MemoryPlanningPass(
+            alloc_graph_input=False,
+            share_mutable_buffers=True,    # KV-cache shared between methods
+        ),
+        sym_shape_eval_pass=ConstraintBasedSymShapeEvalPass(),
+    ),
+    additional_passes=[
+        InitializedMutableBufferPass(["kv_cache_pos"]),  # Initialize position tracker
+    ],
+)
+
+with open("llama_prefill_decode.pte", "wb") as f:
+    f.write(export_program.buffer)
+```
+
+### What Each Option Does
+
+| Option | Effect |
+|--------|--------|
+| `share_mutable_buffers=True` | KV-cache tensors get `mem_id=2` with fixed offsets. Both methods write to the same physical memory at runtime. |
+| `alloc_graph_input=False` | Graph inputs (tokens, input_pos) are provided by the runner, not pre-allocated in the PTE. |
+| `InitializedMutableBufferPass(["kv_cache_pos"])` | Saves the initial `[0, 1, 2, ..., max_seq_len-1]` values of `kv_cache_pos` into the PTE so the position tracker starts correctly. |
+| `ConstraintBasedSymShapeEvalPass` | Resolves symbolic shapes (from `Dim("seq", ...)`) to concrete upper bounds for memory planning. |
+
+### What Changes in the PTE File
+
+```
+Without share_mutable_buffers:
+  non_const_buffer_sizes = [0, activation_size]        # 2 entries
+  KV-cache tensors: mem_id=1, offsets from greedy algo (may overlap)
+
+With share_mutable_buffers:
+  non_const_buffer_sizes = [0, activation_size, kv_cache_size]  # 3 entries
+  KV-cache tensors: mem_id=2, sequential non-overlapping offsets
+  Both kv_forward and decode have identical mem_id=2 offsets
+```
+
+### Using export_llama.py (Convenience Script)
+
+```bash
+python -m examples.models.llama.export_llama \
+    --model llama3 \
+    --checkpoint path/to/checkpoint.pth \
+    --params path/to/params.json \
+    -kv \
+    --prefill_dynamic \
+    --xnnpack \
+    --output_name llama3_prefill_decode.pte
+```
+
+Key flags:
+- `-kv`: Enable KV-cache
+- `--prefill_dynamic`: Export separate prefill (dynamic seq) and decode (seq=1) methods
+
+## 11. Memory Size Calculation
 
 ```
 Per layer KV-cache size:
