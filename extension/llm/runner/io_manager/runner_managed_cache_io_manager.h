@@ -46,6 +46,8 @@ class RunnerManagedCacheIOManager : public IOManager {
     size_t n_layers;
     size_t n_kv_heads;
     size_t head_dim;
+    size_t attn_mask_rows = 128;
+    size_t attn_mask_cols = 1024;
   };
 
   RunnerManagedCacheIOManager(
@@ -56,6 +58,8 @@ class RunnerManagedCacheIOManager : public IOManager {
     decode_cache_len_ = config_.max_seq_len - 1;
     head_size_ = config_.n_kv_heads * config_.head_dim;
 
+    attn_mask_.resize(
+        config_.attn_mask_rows * config_.attn_mask_cols, 0.0f);
     allocate_buffers();
   }
 
@@ -79,6 +83,7 @@ class RunnerManagedCacheIOManager : public IOManager {
       std::fill(
           decode_v_input_[l].begin(), decode_v_input_[l].end(), 0.0f);
     }
+    std::fill(attn_mask_.begin(), attn_mask_.end(), 0.0f);
     return runtime::Error::Ok;
   }
 
@@ -89,11 +94,18 @@ class RunnerManagedCacheIOManager : public IOManager {
     (void)prefill_method;
 
     copy_decode_to_prefill_input();
+    update_attn_mask(current_pos_, config_.prefill_seq_len);
 
     std::vector<runtime::EValue> inputs;
-    inputs.reserve(2 + config_.n_layers * 2);
+    inputs.reserve(3 + config_.n_layers * 2);
     inputs.emplace_back(input);
     inputs.emplace_back(start_pos);
+
+    attn_mask_tensor_ = from_blob(
+        attn_mask_.data(),
+        {static_cast<executorch::aten::SizesType>(config_.attn_mask_rows),
+         static_cast<executorch::aten::SizesType>(config_.attn_mask_cols)});
+    inputs.emplace_back(attn_mask_tensor_);
 
     prefill_k_input_tensors_.clear();
     prefill_v_input_tensors_.clear();
@@ -128,10 +140,18 @@ class RunnerManagedCacheIOManager : public IOManager {
       const std::string& decode_method) override {
     (void)decode_method;
 
+    update_attn_mask(current_pos_, 1);
+
     std::vector<runtime::EValue> inputs;
-    inputs.reserve(2 + config_.n_layers * 2);
+    inputs.reserve(3 + config_.n_layers * 2);
     inputs.emplace_back(input);
     inputs.emplace_back(start_pos);
+
+    attn_mask_tensor_ = from_blob(
+        attn_mask_.data(),
+        {static_cast<executorch::aten::SizesType>(config_.attn_mask_rows),
+         static_cast<executorch::aten::SizesType>(config_.attn_mask_cols)});
+    inputs.emplace_back(attn_mask_tensor_);
 
     decode_k_input_tensors_.clear();
     decode_v_input_tensors_.clear();
@@ -296,6 +316,24 @@ class RunnerManagedCacheIOManager : public IOManager {
     }
   }
 
+  /**
+   * Update the attention mask for a causal (lower-triangular) pattern.
+   * For each query row r in [0, seq_len), the mask allows attending to
+   * positions [0, pos + r] (value 1) and masks future positions (value 0).
+   */
+  void update_attn_mask(size_t pos, size_t seq_len) {
+    std::fill(attn_mask_.begin(), attn_mask_.end(), 0.0f);
+    for (size_t r = 0; r < seq_len && r < config_.attn_mask_rows; r++) {
+      size_t visible = pos + r + 1;
+      if (visible > config_.attn_mask_cols) {
+        visible = config_.attn_mask_cols;
+      }
+      for (size_t c = 0; c < visible; c++) {
+        attn_mask_[r * config_.attn_mask_cols + c] = 1.0f;
+      }
+    }
+  }
+
   Config config_;
   size_t prefill_cache_len_;
   size_t decode_cache_len_;
@@ -307,6 +345,10 @@ class RunnerManagedCacheIOManager : public IOManager {
   std::vector<std::vector<float>> prefill_v_input_;
   std::vector<std::vector<float>> decode_k_input_;
   std::vector<std::vector<float>> decode_v_input_;
+
+  // Attention mask buffer: [attn_mask_rows, attn_mask_cols] flattened
+  std::vector<float> attn_mask_;
+  TensorPtr attn_mask_tensor_;
 
   // Tensor wrappers (kept alive between prepare and model execution)
   std::vector<TensorPtr> prefill_k_input_tensors_;
