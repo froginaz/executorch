@@ -773,6 +773,16 @@ if(EXECUTORCH_BUILD_EXTENSION_LLM)
     )
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
   endif()
+  # Abseil's C++17 feature detection via check_cxx_source_compiles may fail
+  # when CMAKE_CXX_STANDARD is not propagated to try_compile (observed with
+  # CMake 3.31). Pre-set the detection result so abseil installs headers that
+  # alias absl::string_view to std::string_view, avoiding conflicts with
+  # sentencepiece headers.
+  if(CMAKE_CXX_STANDARD GREATER_EQUAL 17
+     AND NOT DEFINED CACHE{ABSL_INTERNAL_AT_LEAST_CXX17}
+  )
+    set(ABSL_INTERNAL_AT_LEAST_CXX17 1 CACHE INTERNAL "")
+  endif()
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extension/llm/tokenizers)
   if(EXECUTORCH_BUILD_EXTENSION_LLM_RUNNER)
     set(CMAKE_POSITION_INDEPENDENT_CODE

@@ -11,42 +11,59 @@
 /**
  * @file
  *
- * This tool can run ExecuTorch model files with Enn runtime.
- * It assumes all inputs and output are fp32, please give a list for input
- * files. And Enn backends is going to inference, and output results.
+ * This tool can run ExecuTorch model files that contain separate prefill and
+ * decode methods sharing a KV-cache via externally allocated buffers.
+ * On Android it uses the ENN backend; on x86 it uses XNNPACK.
  */
 
+#ifdef __ANDROID__
 #include <executorch/backends/samsung/runtime/enn_executor.h>
 #include <executorch/backends/samsung/runtime/profile.hpp>
+#else
+#define EXYNOS_ATRACE_BEGIN(name)
+#define EXYNOS_ATRACE_END()
+#endif
 #include <executorch/extension/data_loader/file_data_loader.h>
 #include <executorch/extension/evalue_util/print_evalue.h>
 #include <executorch/extension/runner_util/inputs.h>
+#include <executorch/runtime/core/hierarchical_allocator.h>
 #include <executorch/runtime/executor/method.h>
 #include <executorch/runtime/executor/program.h>
 #include <executorch/runtime/platform/log.h>
 #include <executorch/runtime/platform/runtime.h>
 #include <gflags/gflags.h>
 
+#include <algorithm>
 #include <fstream>
 #include <memory>
 #include <sstream>
 
-static uint8_t method_allocator_pool[4 * 1024U * 1024U]; // 4 MB
+static uint8_t method_allocator_pool[8 * 1024U * 1024U]; // 8 MB (two methods)
+static uint8_t prefill_allocator_pool[4 * 1024U * 1024U]; // 4 MB
 
 DEFINE_string(model, "model.pte", "Model serialized in flatbuffer format.");
+DEFINE_string(
+    prefill_method,
+    "prefill",
+    "Name of the prefill method in the PTE.");
+DEFINE_string(
+    decode_method,
+    "decode",
+    "Name of the decode method in the PTE.");
 DEFINE_string(
     input,
     "",
     "Input file path, support multiple inputs: input_1 input_2 ...");
-DEFINE_uint32(num_executions, 1, "Number of times to run the model.");
-
+DEFINE_uint32(num_executions, 1, "Number of decode steps to run.");
 DEFINE_int32(warm_up, 0, "Pre-run before inference.");
 DEFINE_bool(dump_statistics, false, "Dump inference statistics.");
 DEFINE_string(output_path, "", "Output Execution results to target directory.");
 
 using namespace torch::executor;
 using torch::executor::util::FileDataLoader;
+#ifdef __ANDROID__
 using namespace torch::executor::enn;
+#endif
 
 std::vector<std::string> split(std::string str, char delimiter = ' ') {
   std::vector<std::string> result;
@@ -118,6 +135,7 @@ void saveOutput(const exec_aten::Tensor& tensor, int32_t output_index) {
   fout.close();
 }
 
+#ifdef __ANDROID__
 struct EnnApiDeinit {
   void operator()(EnnApi* ptr) const {
     if (ptr == nullptr) {
@@ -135,10 +153,61 @@ std::unique_ptr<EnnApi, EnnApiDeinit> exynos_npu_init() {
   ET_CHECK_MSG(ret == ENN_RET_SUCCESS, "Enn initialize failed.");
   return std::unique_ptr<EnnApi, EnnApiDeinit>(enn_api_inst);
 }
+#endif
+
+struct SharedPlannedMemory {
+  std::vector<std::vector<uint8_t>> buffers;
+  std::vector<Span<uint8_t>> spans;
+  std::unique_ptr<HierarchicalAllocator> allocator;
+};
+
+SharedPlannedMemory create_shared_planned_memory(
+    const MethodMeta& prefill_meta,
+    const MethodMeta& decode_meta) {
+  SharedPlannedMemory shared;
+
+  size_t prefill_bufs = prefill_meta.num_memory_planned_buffers();
+  size_t decode_bufs = decode_meta.num_memory_planned_buffers();
+  size_t num_buffers = std::max(prefill_bufs, decode_bufs);
+
+  shared.buffers.reserve(num_buffers);
+  shared.spans.reserve(num_buffers);
+
+  for (size_t i = 0; i < num_buffers; ++i) {
+    int64_t pf_size =
+        (i < prefill_bufs)
+        ? prefill_meta.memory_planned_buffer_size(i).get()
+        : 0;
+    int64_t dc_size =
+        (i < decode_bufs)
+        ? decode_meta.memory_planned_buffer_size(i).get()
+        : 0;
+    size_t max_size = static_cast<size_t>(std::max(pf_size, dc_size));
+
+    ET_LOG(
+        Info,
+        "Shared planned buffer %zu: prefill=%lld, decode=%lld, alloc=%zu",
+        i,
+        (long long)pf_size,
+        (long long)dc_size,
+        max_size);
+
+    shared.buffers.emplace_back(max_size);
+    shared.spans.emplace_back(
+        shared.buffers.back().data(), max_size);
+  }
+
+  shared.allocator = std::make_unique<HierarchicalAllocator>(Span<Span<uint8_t>>(
+      shared.spans.data(), shared.spans.size()));
+
+  return shared;
+}
 
 int main(int argc, char** argv) {
   auto before_init = std::chrono::high_resolution_clock::now();
+#ifdef __ANDROID__
   std::unique_ptr<EnnApi, EnnApiDeinit> instance = exynos_npu_init();
+#endif
   auto after_init = std::chrono::high_resolution_clock::now();
   double interval_init = std::chrono::duration_cast<std::chrono::microseconds>(
                              after_init - before_init)
@@ -155,9 +224,6 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // Create a loader to get the data of the program file. There are other
-  // DataLoaders that use mmap() or point to data that's already in memory, and
-  // users can create their own DataLoaders to load from arbitrary sources.
   const char* model_path = FLAGS_model.c_str();
   Result<FileDataLoader> loader = FileDataLoader::from(model_path);
   ET_CHECK_MSG(
@@ -165,8 +231,6 @@ int main(int argc, char** argv) {
       "FileDataLoader::from() failed: 0x%" PRIx32,
       (uint32_t)loader.error());
 
-  // Parse the program file. This is immutable, and can also be reused between
-  // multiple execution invocations across multiple threads.
   Result<Program> program = Program::load(&loader.get());
   if (!program.ok()) {
     ET_LOG(Error, "Failed to parse model file %s", model_path);
@@ -174,209 +238,183 @@ int main(int argc, char** argv) {
   }
   ET_LOG(Info, "Model file %s is loaded.", model_path);
 
-  // Use the first method in the program.
-  const char* method_name = nullptr;
-  {
-    const auto method_name_result = program->get_method_name(0);
-    ET_CHECK_MSG(method_name_result.ok(), "Program has no methods");
-    method_name = *method_name_result;
-  }
-  ET_LOG(Info, "Using method %s", method_name);
+  const char* prefill_name = FLAGS_prefill_method.c_str();
+  const char* decode_name = FLAGS_decode_method.c_str();
 
-  // MethodMeta describes the memory requirements of the method.
-  Result<MethodMeta> method_meta = program->method_meta(method_name);
+  Result<MethodMeta> prefill_meta = program->method_meta(prefill_name);
   ET_CHECK_MSG(
-      method_meta.ok(),
+      prefill_meta.ok(),
       "Failed to get method_meta for %s: 0x%" PRIx32,
-      method_name,
-      (uint32_t)method_meta.error());
+      prefill_name,
+      (uint32_t)prefill_meta.error());
 
-  //
-  // The runtime does not use malloc/new; it allocates all memory using the
-  // MemoryManger provided by the client. Clients are responsible for allocating
-  // the memory ahead of time, or providing MemoryAllocator subclasses that can
-  // do it dynamically.
-  //
+  Result<MethodMeta> decode_meta = program->method_meta(decode_name);
+  ET_CHECK_MSG(
+      decode_meta.ok(),
+      "Failed to get method_meta for %s: 0x%" PRIx32,
+      decode_name,
+      (uint32_t)decode_meta.error());
 
-  // The method allocator is used to allocate all dynamic C++ metadata/objects
-  // used to represent the loaded method. This allocator is only used during
-  // loading a method of the program, which will return an error if there was
-  // not enough memory.
-  //
-  // The amount of memory required depends on the loaded method and the runtime
-  // code itself. The amount of memory here is usually determined by running the
-  // method and seeing how much memory is actually used, though it's possible to
-  // subclass MemoryAllocator so that it calls malloc() under the hood (see
-  // MallocMemoryAllocator).
-  //
-  // In this example we use a statically allocated memory pool.
-  MemoryAllocator method_allocator{
-      MemoryAllocator(sizeof(method_allocator_pool), method_allocator_pool)};
+  // Allocate shared planned memory (includes KV-cache on mem_id=2).
+  // Both methods get the same physical buffers so KV-cache state written
+  // by prefill is visible to decode without any copy.
+  auto shared_memory =
+      create_shared_planned_memory(*prefill_meta, *decode_meta);
 
-  // The memory-planned buffers will back the mutable tensors used by the
-  // method. The sizes of these buffers were determined ahead of time during the
-  // memory-planning pasees.
-  //
-  // Each buffer typically corresponds to a different hardware memory bank. Most
-  // mobile environments will only have a single buffer. Some embedded
-  // environments may have more than one for, e.g., slow/large DRAM and
-  // fast/small SRAM, or for memory associated with particular cores.
-  std::vector<std::unique_ptr<uint8_t[]>> planned_buffers; // Owns the memory
-  std::vector<Span<uint8_t>> planned_spans; // Passed to the allocator
-  size_t num_memory_planned_buffers = method_meta->num_memory_planned_buffers();
-  for (size_t id = 0; id < num_memory_planned_buffers; ++id) {
-    // .get() will always succeed because id < num_memory_planned_buffers.
-    size_t buffer_size =
-        static_cast<size_t>(method_meta->memory_planned_buffer_size(id).get());
-    ET_LOG(Info, "Setting up planned buffer %zu, size %zu.", id, buffer_size);
-    planned_buffers.push_back(std::make_unique<uint8_t[]>(buffer_size));
-    planned_spans.push_back({planned_buffers.back().get(), buffer_size});
-  }
-  HierarchicalAllocator planned_memory(
-      {planned_spans.data(), planned_spans.size()});
+  // Separate method allocators for each method's internal metadata.
+  MemoryAllocator prefill_method_allocator{MemoryAllocator(
+      sizeof(prefill_allocator_pool), prefill_allocator_pool)};
+  MemoryAllocator decode_method_allocator{MemoryAllocator(
+      sizeof(method_allocator_pool), method_allocator_pool)};
 
-  // Assemble all of the allocators into the MemoryManager that the Executor
-  // will use.
-  MemoryManager memory_manager(&method_allocator, &planned_memory);
+  MemoryManager prefill_memory_manager(
+      &prefill_method_allocator, shared_memory.allocator.get());
+  MemoryManager decode_memory_manager(
+      &decode_method_allocator, shared_memory.allocator.get());
 
-  //
-  // Load the method from the program, using the provided allocators. Running
-  // the method can mutate the memory-planned buffers, so the method should only
-  // be used by a single thread at at time, but it can be reused.
-  //
-
-  EXYNOS_ATRACE_BEGIN("Test Runner: Load Method");
+  // Load prefill method
+  EXYNOS_ATRACE_BEGIN("Load prefill method");
   auto before_load = std::chrono::high_resolution_clock::now();
-  Result<Method> method = program->load_method(method_name, &memory_manager);
+  Result<Method> prefill_method =
+      program->load_method(prefill_name, &prefill_memory_manager);
+  ET_CHECK_MSG(
+      prefill_method.ok(),
+      "Loading prefill method %s failed with status 0x%" PRIx32,
+      prefill_name,
+      (uint32_t)prefill_method.error());
+  ET_LOG(Info, "Prefill method %s loaded.", prefill_name);
+  EXYNOS_ATRACE_END();
+
+  // Load decode method (shares planned memory with prefill)
+  EXYNOS_ATRACE_BEGIN("Load decode method");
+  Result<Method> decode_method =
+      program->load_method(decode_name, &decode_memory_manager);
   auto after_load = std::chrono::high_resolution_clock::now();
   double interval_load = std::chrono::duration_cast<std::chrono::microseconds>(
                              after_load - before_load)
                              .count() /
       1000.0;
-  EXYNOS_ATRACE_END();
   ET_CHECK_MSG(
-      method.ok(),
-      "Loading of method %s failed with status 0x%" PRIx32,
-      method_name,
-      (uint32_t)method.error());
-  ET_LOG(Info, "Method loaded.");
+      decode_method.ok(),
+      "Loading decode method %s failed with status 0x%" PRIx32,
+      decode_name,
+      (uint32_t)decode_method.error());
+  ET_LOG(Info, "Decode method %s loaded.", decode_name);
+  EXYNOS_ATRACE_END();
 
+  // --- Prefill phase ---
+  ET_LOG(Info, "Running prefill...");
   bool _is_input_arg_existed = (FLAGS_input != "");
   auto input_files = split(FLAGS_input);
-  DataReader input_data_reader(method->inputs_size());
+  DataReader prefill_data_reader(prefill_method->inputs_size());
 
-  EXYNOS_ATRACE_BEGIN("Test Runner: prepare input");
+  EXYNOS_ATRACE_BEGIN("Prepare prefill input");
   if (!_is_input_arg_existed) {
-    // Allocate input tensors and set all of their elements to 1. The `inputs`
-    // variable owns the allocated memory and must live past the last call to
-    // `execute()`.
-    for (int input_index = 0; input_index < method->inputs_size();
-         ++input_index) {
-      MethodMeta method_meta = method->method_meta();
-      Result<TensorInfo> tensor_meta =
-          method_meta.input_tensor_meta(input_index);
-      input_data_reader.alloc(tensor_meta->nbytes());
-    }
-    auto inputs = executorch::extension::prepare_input_tensors(*method);
+    auto inputs = executorch::extension::prepare_input_tensors(*prefill_method);
     ET_CHECK_MSG(
         inputs.ok(),
-        "Could not prepare inputs: 0x%" PRIx32,
+        "Could not prepare prefill inputs: 0x%" PRIx32,
         (uint32_t)inputs.error());
-    ET_LOG(
-        Info,
-        "Input list not provided. Inputs prepared with default values set.");
+    ET_LOG(Info, "Prefill inputs prepared with default values.");
   } else {
     ET_CHECK_MSG(
-        input_files.size() == method->inputs_size(),
+        input_files.size() == prefill_method->inputs_size(),
         "Please check the number of given input binary files");
     for (const auto& input_file : input_files) {
-      input_data_reader.read(input_file);
+      prefill_data_reader.read(input_file);
+    }
+    for (int input_index = 0; input_index < prefill_method->inputs_size();
+         ++input_index) {
+      MethodMeta meta = prefill_method->method_meta();
+      Result<TensorInfo> tensor_meta = meta.input_tensor_meta(input_index);
+      ET_CHECK_MSG(
+          prefill_data_reader.nbytes(input_index) == tensor_meta->nbytes(),
+          "Given prefill input size is invalid");
+      TensorImpl impl = TensorImpl(
+          tensor_meta->scalar_type(),
+          tensor_meta->sizes().size(),
+          const_cast<TensorImpl::SizesType*>(tensor_meta->sizes().data()),
+          prefill_data_reader.get(input_index),
+          const_cast<TensorImpl::DimOrderType*>(
+              tensor_meta->dim_order().data()));
+      Error ret = prefill_method->set_input(Tensor(&impl), input_index);
+      ET_CHECK_MSG(
+          ret == Error::Ok, "Failed to set prefill input tensor: %d", ret);
     }
   }
   EXYNOS_ATRACE_END();
-  EXYNOS_ATRACE_BEGIN("Test Runner: set input");
-  for (int input_index = 0; input_index < method->inputs_size();
-       ++input_index) {
-    MethodMeta method_meta = method->method_meta();
-    Result<TensorInfo> tensor_meta = method_meta.input_tensor_meta(input_index);
-    ET_CHECK_MSG(
-        input_data_reader.nbytes(input_index) == tensor_meta->nbytes(),
-        "Given inputs size is invalid");
-    TensorImpl impl = TensorImpl(
-        tensor_meta->scalar_type(),
-        tensor_meta->sizes().size(),
-        const_cast<TensorImpl::SizesType*>(tensor_meta->sizes().data()),
-        input_data_reader.get(input_index),
-        const_cast<TensorImpl::DimOrderType*>(tensor_meta->dim_order().data()));
-    Error ret = method->set_input(Tensor(&impl), input_index);
-    ET_CHECK_MSG(ret == Error::Ok, "Failed to set input tensor: %d", ret);
-  }
-  EXYNOS_ATRACE_END();
+
+  auto before_prefill = std::chrono::high_resolution_clock::now();
+  Error status = prefill_method->execute();
+  auto after_prefill = std::chrono::high_resolution_clock::now();
+  double interval_prefill =
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          after_prefill - before_prefill)
+          .count() /
+      1000.0;
+  ET_CHECK_MSG(
+      status == Error::Ok,
+      "Prefill execution failed with status 0x%" PRIx32,
+      static_cast<int32_t>(status));
+  ET_LOG(Info, "Prefill done in %f ms.", interval_prefill);
+
+  // --- Decode phase ---
+  // KV-cache is already populated by prefill in the shared planned memory.
+  ET_LOG(Info, "Running %d decode steps...", FLAGS_num_executions);
 
   // Warm up
-  ET_LOG(Info, "Perform %d inference for warming up", FLAGS_warm_up);
-  Error status;
   for (int i = 0; i < FLAGS_warm_up; ++i) {
-    status = method->execute();
+    auto inputs = executorch::extension::prepare_input_tensors(*decode_method);
+    ET_CHECK_MSG(inputs.ok(), "Could not prepare decode warm-up inputs");
+    decode_method->execute();
   }
 
-  // Run the model.
-  ET_LOG(Info, "Start 1st inference.");
-  auto before_exec = std::chrono::high_resolution_clock::now();
-  status = method->execute();
-  auto after_exec = std::chrono::high_resolution_clock::now();
-  double interval_1st_infs =
+  auto before_decode = std::chrono::high_resolution_clock::now();
+  for (uint32_t i = 0; i < FLAGS_num_executions; ++i) {
+    auto inputs = executorch::extension::prepare_input_tensors(*decode_method);
+    ET_CHECK_MSG(inputs.ok(), "Could not prepare decode inputs");
+    status = decode_method->execute();
+    ET_CHECK_MSG(
+        status == Error::Ok,
+        "Decode step %d failed with status 0x%" PRIx32,
+        i,
+        static_cast<int32_t>(status));
+  }
+  auto after_decode = std::chrono::high_resolution_clock::now();
+  double interval_decode =
       std::chrono::duration_cast<std::chrono::microseconds>(
-          after_exec - before_exec)
+          after_decode - before_decode)
           .count() /
       1000.0;
 
-  ET_LOG(Info, "Start inference.");
-  before_exec = std::chrono::high_resolution_clock::now();
-  for (int i = 0; i < FLAGS_num_executions; ++i) {
-    status = method->execute();
-  }
-  after_exec = std::chrono::high_resolution_clock::now();
-  double interval_infs = std::chrono::duration_cast<std::chrono::microseconds>(
-                             after_exec - before_exec)
-                             .count() /
-      1000.0;
+  ET_LOG(
+      Info,
+      "%d decode steps took %f ms, avg %f ms/step",
+      FLAGS_num_executions,
+      interval_decode,
+      interval_decode / (float)FLAGS_num_executions);
 
   if (FLAGS_dump_statistics) {
     auto output_file_name = "statistics.txt";
     std::ofstream fout(output_file_name);
     fout << "init: " + std::to_string(interval_init)
          << "\nload: " + std::to_string(interval_load)
-         << "\n1st: " + std::to_string(interval_1st_infs)
-         << "\navg: " +
-            std::to_string(
-                (interval_infs + interval_1st_infs) /
-                ((float)FLAGS_num_executions + 1.f))
+         << "\nprefill: " + std::to_string(interval_prefill)
+         << "\ndecode_total: " + std::to_string(interval_decode)
+         << "\ndecode_avg: " +
+            std::to_string(interval_decode / (float)FLAGS_num_executions)
          << std::endl;
     fout.close();
   }
 
-  ET_LOG(
-      Info,
-      "%d inference took %f ms, avg %f ms",
-      FLAGS_num_executions,
-      interval_infs,
-      interval_infs / (float)FLAGS_num_executions);
-  ET_CHECK_MSG(
-      status == Error::Ok,
-      "Execution of method %s failed with status 0x%" PRIx32,
-      method_name,
-      static_cast<int32_t>(status));
-
-  // Get the outputs.
-  std::vector<EValue> outputs(method->outputs_size());
-  status = method->get_outputs(outputs.data(), outputs.size());
+  // Get outputs from decode method
+  std::vector<EValue> outputs(decode_method->outputs_size());
+  status = decode_method->get_outputs(outputs.data(), outputs.size());
   ET_CHECK(status == Error::Ok);
 
-  for (size_t output_index = 0; output_index < method->outputs_size();
+  for (size_t output_index = 0; output_index < decode_method->outputs_size();
        ++output_index) {
     auto output_tensor = outputs[output_index].toTensor();
-    // Save the results to given directory in order.
     saveOutput(output_tensor, output_index);
   }
 

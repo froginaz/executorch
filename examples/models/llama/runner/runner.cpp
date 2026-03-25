@@ -38,7 +38,8 @@ std::unique_ptr<llm::TextLLMRunner> create_llama_runner(
     std::optional<const std::string> data_path,
     float temperature,
     std::unique_ptr<::executorch::runtime::EventTracer> event_tracer,
-    const std::string& method_name) {
+    const std::string& method_name,
+    const std::string& prefill_method_name) {
   if (data_path.has_value()) {
     std::vector<std::string> data_files;
     data_files.push_back(data_path.value());
@@ -48,7 +49,8 @@ std::unique_ptr<llm::TextLLMRunner> create_llama_runner(
         std::move(data_files),
         temperature,
         std::move(event_tracer),
-        method_name);
+        method_name,
+        prefill_method_name);
   }
   return create_llama_runner(
       model_path,
@@ -56,7 +58,8 @@ std::unique_ptr<llm::TextLLMRunner> create_llama_runner(
       std::vector<std::string>(),
       temperature,
       std::move(event_tracer),
-      method_name);
+      method_name,
+      prefill_method_name);
 }
 
 std::unique_ptr<llm::TextLLMRunner> create_llama_runner(
@@ -65,7 +68,8 @@ std::unique_ptr<llm::TextLLMRunner> create_llama_runner(
     std::vector<std::string> data_files,
     float temperature,
     std::unique_ptr<::executorch::runtime::EventTracer> event_tracer,
-    const std::string& method_name) {
+    const std::string& method_name,
+    const std::string& prefill_method_name) {
   ET_LOG(
       Info,
       "Creating LLaMa runner: model_path=%s, tokenizer_path=%s",
@@ -89,7 +93,9 @@ std::unique_ptr<llm::TextLLMRunner> create_llama_runner(
       data_files,
       temperature,
       std::move(event_tracer),
-      method_name);
+      method_name,
+      Module::LoadMode::MmapUseMlockIgnoreErrors,
+      prefill_method_name);
 }
 
 } // namespace example
