@@ -34,15 +34,20 @@ namespace llm {
  *
  * Prefill (per micro-batch):
  *   Input:  token[prefill_seq_len], start_pos, attn_mask[R,C],
- *           k_cache[1,H,past,D] x L, v_cache[1,H,past,D] x L
- *   Output: logits, k_cache[1,H,prefill_seq_len,D] x L,
- *           v_cache[1,H,prefill_seq_len,D] x L
+ *           k_cache_0[1,H,past,D], ..., k_cache_{L-1}[1,H,past,D],
+ *           v_cache_0[1,H,past,D], ..., v_cache_{L-1}[1,H,past,D]
+ *   Output: logits,
+ *           k_cache_0[1,H,prefill_seq_len,D], ..., k_cache_{L-1},
+ *           v_cache_0[1,H,prefill_seq_len,D], ..., v_cache_{L-1}
  *   where past = max_seq_len - prefill_seq_len
  *
  * Decode:
  *   Input:  token[1], start_pos, attn_mask[R,C],
- *           k_cache[1,H,max-1,D] x L, v_cache[1,H,max-1,D] x L
- *   Output: logits, k_cache[1,H,1,D] x L, v_cache[1,H,1,D] x L
+ *           k_cache_0[1,H,max-1,D], ..., k_cache_{L-1}[1,H,max-1,D],
+ *           v_cache_0[1,H,max-1,D], ..., v_cache_{L-1}[1,H,max-1,D]
+ *   Output: logits,
+ *           k_cache_0[1,H,1,D], ..., k_cache_{L-1},
+ *           v_cache_0[1,H,1,D], ..., v_cache_{L-1}
  */
 class RunnerManagedCacheIOManager : public IOManager {
  public:
@@ -129,15 +134,17 @@ class RunnerManagedCacheIOManager : public IOManager {
            static_cast<executorch::aten::SizesType>(config_.n_kv_heads),
            static_cast<executorch::aten::SizesType>(prefill_cache_len_),
            static_cast<executorch::aten::SizesType>(config_.head_dim)});
+      prefill_k_input_tensors_.push_back(k_in);
+      inputs.emplace_back(k_in);
+    }
+    for (size_t l = 0; l < config_.n_layers; l++) {
       auto v_in = from_blob(
           prefill_v_input_[l].data(),
           {1,
            static_cast<executorch::aten::SizesType>(config_.n_kv_heads),
            static_cast<executorch::aten::SizesType>(prefill_cache_len_),
            static_cast<executorch::aten::SizesType>(config_.head_dim)});
-      prefill_k_input_tensors_.push_back(k_in);
       prefill_v_input_tensors_.push_back(v_in);
-      inputs.emplace_back(k_in);
       inputs.emplace_back(v_in);
     }
 
@@ -180,15 +187,17 @@ class RunnerManagedCacheIOManager : public IOManager {
            static_cast<executorch::aten::SizesType>(config_.n_kv_heads),
            static_cast<executorch::aten::SizesType>(decode_cache_len_),
            static_cast<executorch::aten::SizesType>(config_.head_dim)});
+      decode_k_input_tensors_.push_back(k_in);
+      inputs.emplace_back(k_in);
+    }
+    for (size_t l = 0; l < config_.n_layers; l++) {
       auto v_in = from_blob(
           decode_v_input_[l].data(),
           {1,
            static_cast<executorch::aten::SizesType>(config_.n_kv_heads),
            static_cast<executorch::aten::SizesType>(decode_cache_len_),
            static_cast<executorch::aten::SizesType>(config_.head_dim)});
-      decode_k_input_tensors_.push_back(k_in);
       decode_v_input_tensors_.push_back(v_in);
-      inputs.emplace_back(k_in);
       inputs.emplace_back(v_in);
     }
 
@@ -199,24 +208,26 @@ class RunnerManagedCacheIOManager : public IOManager {
       const std::vector<runtime::EValue>& model_outputs,
       const std::string& prefill_method) override {
     (void)prefill_method;
-    // model_outputs: [logits, k0, v0, k1, v1, ..., k15, v15]
+    // model_outputs: [logits, k0, ..., k_{L-1}, v0, ..., v_{L-1}]
     // k_out shape: [1, n_kv_heads, prefill_seq_len, head_dim]
     // Accumulate prefill output into prefill input buffers. The copy to
     // decode input is deferred until the first prepare_decode call so that
     // multiple micro-batch prefill iterations work correctly.
 
     for (size_t l = 0; l < config_.n_layers; l++) {
-      const auto& k_out = model_outputs[1 + l * 2].toTensor();
-      const auto& v_out = model_outputs[1 + l * 2 + 1].toTensor();
+      const auto& k_out = model_outputs[1 + l].toTensor();
       const float* k_data = k_out.const_data_ptr<float>();
-      const float* v_data = v_out.const_data_ptr<float>();
-
       copy_to_cache(
           k_data,
           config_.prefill_seq_len,
           prefill_k_input_[l].data(),
           prefill_cache_len_,
           current_pos_);
+    }
+    for (size_t l = 0; l < config_.n_layers; l++) {
+      const auto& v_out =
+          model_outputs[1 + config_.n_layers + l].toTensor();
+      const float* v_data = v_out.const_data_ptr<float>();
       copy_to_cache(
           v_data,
           config_.prefill_seq_len,
@@ -232,22 +243,24 @@ class RunnerManagedCacheIOManager : public IOManager {
       const std::vector<runtime::EValue>& model_outputs,
       const std::string& decode_method) override {
     (void)decode_method;
-    // model_outputs: [logits, k0, v0, k1, v1, ..., k15, v15]
+    // model_outputs: [logits, k0, ..., k_{L-1}, v0, ..., v_{L-1}]
     // k_out shape: [1, n_kv_heads, 1, head_dim]
     // Copy decode output into decode input cache at current_pos_.
 
     for (size_t l = 0; l < config_.n_layers; l++) {
-      const auto& k_out = model_outputs[1 + l * 2].toTensor();
-      const auto& v_out = model_outputs[1 + l * 2 + 1].toTensor();
+      const auto& k_out = model_outputs[1 + l].toTensor();
       const float* k_data = k_out.const_data_ptr<float>();
-      const float* v_data = v_out.const_data_ptr<float>();
-
       copy_to_cache(
           k_data,
           1,
           decode_k_input_[l].data(),
           decode_cache_len_,
           current_pos_);
+    }
+    for (size_t l = 0; l < config_.n_layers; l++) {
+      const auto& v_out =
+          model_outputs[1 + config_.n_layers + l].toTensor();
+      const float* v_data = v_out.const_data_ptr<float>();
       copy_to_cache(
           v_data,
           1,
