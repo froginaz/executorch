@@ -26,17 +26,23 @@ namespace llm {
  * as output. The runner is responsible for concatenating outputs into the
  * cache and feeding the updated cache back on the next step.
  *
- * Prefill:
- *   Input:  token, start_pos, k_cache[1,H,past,D] x L, v_cache[1,H,past,D] x L
- *   Output: logits, k_cache[1,H,seq,D] x L, v_cache[1,H,seq,D] x L
+ * Supports micro-batch prefill: the runner may call prepare_prefill /
+ * update_prefill multiple times (each processing prefill_seq_len tokens)
+ * before switching to decode. The KV-cache accumulates in the prefill
+ * buffer across micro-batches and is copied to the decode buffer on the
+ * first prepare_decode call.
+ *
+ * Prefill (per micro-batch):
+ *   Input:  token[prefill_seq_len], start_pos, attn_mask[R,C],
+ *           k_cache[1,H,past,D] x L, v_cache[1,H,past,D] x L
+ *   Output: logits, k_cache[1,H,prefill_seq_len,D] x L,
+ *           v_cache[1,H,prefill_seq_len,D] x L
  *   where past = max_seq_len - prefill_seq_len
  *
  * Decode:
- *   Input:  token, start_pos, k_cache[1,H,max-1,D] x L, v_cache[1,H,max-1,D] x L
+ *   Input:  token[1], start_pos, attn_mask[R,C],
+ *           k_cache[1,H,max-1,D] x L, v_cache[1,H,max-1,D] x L
  *   Output: logits, k_cache[1,H,1,D] x L, v_cache[1,H,1,D] x L
- *
- * After prefill, the output cache is copied into the decode input cache.
- * Each decode step appends its output to the decode input cache.
  */
 class RunnerManagedCacheIOManager : public IOManager {
  public:
@@ -77,7 +83,12 @@ class RunnerManagedCacheIOManager : public IOManager {
     (void)prefill_method;
     (void)decode_method;
     current_pos_ = 0;
+    prefill_done_ = false;
     for (size_t l = 0; l < config_.n_layers; l++) {
+      std::fill(
+          prefill_k_input_[l].begin(), prefill_k_input_[l].end(), 0.0f);
+      std::fill(
+          prefill_v_input_[l].begin(), prefill_v_input_[l].end(), 0.0f);
       std::fill(
           decode_k_input_[l].begin(), decode_k_input_[l].end(), 0.0f);
       std::fill(
@@ -139,6 +150,11 @@ class RunnerManagedCacheIOManager : public IOManager {
       const std::string& decode_method) override {
     (void)decode_method;
 
+    if (!prefill_done_) {
+      copy_prefill_to_decode_input();
+      prefill_done_ = true;
+    }
+
     update_attn_mask(current_pos_, 1);
 
     std::vector<runtime::EValue> inputs;
@@ -185,8 +201,9 @@ class RunnerManagedCacheIOManager : public IOManager {
     (void)prefill_method;
     // model_outputs: [logits, k0, v0, k1, v1, ..., k15, v15]
     // k_out shape: [1, n_kv_heads, prefill_seq_len, head_dim]
-    // Copy prefill output into prefill input buffers first, then into decode
-    // input cache.
+    // Accumulate prefill output into prefill input buffers. The copy to
+    // decode input is deferred until the first prepare_decode call so that
+    // multiple micro-batch prefill iterations work correctly.
 
     for (size_t l = 0; l < config_.n_layers; l++) {
       const auto& k_out = model_outputs[1 + l * 2].toTensor();
@@ -207,7 +224,6 @@ class RunnerManagedCacheIOManager : public IOManager {
           prefill_cache_len_,
           current_pos_);
     }
-    copy_prefill_to_decode_input();
     current_pos_ += config_.prefill_seq_len;
     return runtime::Error::Ok;
   }
@@ -340,6 +356,7 @@ class RunnerManagedCacheIOManager : public IOManager {
   size_t decode_cache_len_;
   size_t head_size_;
   size_t current_pos_ = 0;
+  bool prefill_done_ = false;
 
   // Per-layer input buffers: [1, n_kv_heads, cache_len, head_dim] flattened
   std::vector<std::vector<float>> prefill_k_input_;
