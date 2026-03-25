@@ -25,7 +25,7 @@ const double ROT_EMB_BASE = 500000;
 // Types
 const LLMType MODEL_INPUT_TYPE = LLMType::FP32;
 const LLMType MODEL_OUTPUT_TYPE = LLMType::FP32;
-const LLMType CACHE_TYPE = LLMType::FP32;
+const LLMType CACHE_TYPE = LLMType::FP16;
 const LLMType MASK_TYPE = LLMType::FP32;
 const LLMType ROT_EMB_TYPE = LLMType::FP32;
 
