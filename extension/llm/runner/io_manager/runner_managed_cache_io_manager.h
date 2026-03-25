@@ -93,7 +93,6 @@ class RunnerManagedCacheIOManager : public IOManager {
       const std::string& prefill_method) override {
     (void)prefill_method;
 
-    copy_decode_to_prefill_input();
     update_attn_mask(current_pos_, config_.prefill_seq_len);
 
     std::vector<runtime::EValue> inputs;
@@ -186,7 +185,8 @@ class RunnerManagedCacheIOManager : public IOManager {
     (void)prefill_method;
     // model_outputs: [logits, k0, v0, k1, v1, ..., k15, v15]
     // k_out shape: [1, n_kv_heads, prefill_seq_len, head_dim]
-    // Copy prefill output into decode input cache at current_pos_.
+    // Copy prefill output into prefill input buffers first, then into decode
+    // input cache.
 
     for (size_t l = 0; l < config_.n_layers; l++) {
       const auto& k_out = model_outputs[1 + l * 2].toTensor();
@@ -197,16 +197,17 @@ class RunnerManagedCacheIOManager : public IOManager {
       copy_to_cache(
           k_data,
           config_.prefill_seq_len,
-          decode_k_input_[l].data(),
-          decode_cache_len_,
+          prefill_k_input_[l].data(),
+          prefill_cache_len_,
           current_pos_);
       copy_to_cache(
           v_data,
           config_.prefill_seq_len,
-          decode_v_input_[l].data(),
-          decode_cache_len_,
+          prefill_v_input_[l].data(),
+          prefill_cache_len_,
           current_pos_);
     }
+    copy_prefill_to_decode_input();
     current_pos_ += config_.prefill_seq_len;
     return runtime::Error::Ok;
   }
@@ -267,26 +268,26 @@ class RunnerManagedCacheIOManager : public IOManager {
   }
 
   /**
-   * Copy data from the decode input cache (layout [1,H,decode_cache_len,D])
-   * to the prefill input buffer (layout [1,H,prefill_cache_len,D]).
+   * Copy prefill output KV cache (layout [1,H,prefill_cache_len,D]) into
+   * the decode input buffer (layout [1,H,decode_cache_len,D]).
    *
    * Since the head stride differs between the two layouts, we copy per-head.
    */
-  void copy_decode_to_prefill_input() {
+  void copy_prefill_to_decode_input() {
     for (size_t l = 0; l < config_.n_layers; l++) {
       for (size_t h = 0; h < config_.n_kv_heads; h++) {
-        const float* src = decode_k_input_[l].data() +
-            h * decode_cache_len_ * config_.head_dim;
-        float* dst = prefill_k_input_[l].data() +
+        const float* src = prefill_k_input_[l].data() +
             h * prefill_cache_len_ * config_.head_dim;
+        float* dst = decode_k_input_[l].data() +
+            h * decode_cache_len_ * config_.head_dim;
         std::memcpy(
             dst, src, prefill_cache_len_ * config_.head_dim * sizeof(float));
       }
       for (size_t h = 0; h < config_.n_kv_heads; h++) {
-        const float* src = decode_v_input_[l].data() +
-            h * decode_cache_len_ * config_.head_dim;
-        float* dst = prefill_v_input_[l].data() +
+        const float* src = prefill_v_input_[l].data() +
             h * prefill_cache_len_ * config_.head_dim;
+        float* dst = decode_v_input_[l].data() +
+            h * decode_cache_len_ * config_.head_dim;
         std::memcpy(
             dst, src, prefill_cache_len_ * config_.head_dim * sizeof(float));
       }
