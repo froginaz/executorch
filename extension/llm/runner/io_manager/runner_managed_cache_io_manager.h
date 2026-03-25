@@ -164,7 +164,7 @@ class RunnerManagedCacheIOManager : public IOManager {
 
     attn_mask_tensor_ = from_blob(
         attn_mask_.data(),
-        {static_cast<executorch::aten::SizesType>(config_.attn_mask_rows),
+        {1,
          static_cast<executorch::aten::SizesType>(config_.attn_mask_cols)});
     inputs.emplace_back(attn_mask_tensor_);
 
