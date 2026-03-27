@@ -51,11 +51,11 @@ def convert_kv_dump(filename, cache_len, n_kv_heads=None, head_dim=None):
         for h in range(n_kv_heads):
             nonzero = np.count_nonzero(data[h])
             f.write(f"--- head {h} (nonzero: {nonzero}/{cache_len * head_dim}) ---\n")
-            for s in range(min(cache_len, 8)):
+            for s in range(min(cache_len, 40)):
                 vals = " ".join(f"{v:10.6f}" for v in data[h, s, :8])
                 f.write(f"  seq[{s:4d}]: {vals} ...\n")
-            if cache_len > 8:
-                f.write(f"  ... ({cache_len - 8} more rows)\n")
+            if cache_len > 40:
+                f.write(f"  ... ({cache_len - 40} more rows)\n")
             f.write("\n")
     print(f"Saved: {txt_path}")
 
