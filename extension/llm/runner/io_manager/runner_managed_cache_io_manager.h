@@ -9,7 +9,9 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <executorch/extension/llm/runner/io_manager/io_manager.h>
@@ -89,6 +91,7 @@ class RunnerManagedCacheIOManager : public IOManager {
     (void)decode_method;
     current_pos_ = 0;
     prefill_done_ = false;
+    dump_step_ = 0;
     for (size_t l = 0; l < config_.n_layers; l++) {
       std::fill(
           prefill_k_input_[l].begin(), prefill_k_input_[l].end(), 0.0f);
@@ -148,6 +151,8 @@ class RunnerManagedCacheIOManager : public IOManager {
       inputs.emplace_back(v_in);
     }
 
+    dump_kv_input("prefill");
+
     return inputs;
   }
 
@@ -201,6 +206,8 @@ class RunnerManagedCacheIOManager : public IOManager {
       inputs.emplace_back(v_in);
     }
 
+    dump_kv_input("decode");
+
     return inputs;
   }
 
@@ -235,6 +242,8 @@ class RunnerManagedCacheIOManager : public IOManager {
           prefill_cache_len_,
           current_pos_);
     }
+    dump_kv_output("prefill", model_outputs);
+    dump_step_++;
     current_pos_ += config_.prefill_seq_len;
     return runtime::Error::Ok;
   }
@@ -268,6 +277,8 @@ class RunnerManagedCacheIOManager : public IOManager {
           decode_cache_len_,
           current_pos_);
     }
+    dump_kv_output("decode", model_outputs);
+    dump_step_++;
     current_pos_ += 1;
     return runtime::Error::Ok;
   }
@@ -276,7 +287,76 @@ class RunnerManagedCacheIOManager : public IOManager {
     return current_pos_;
   }
 
+  void enable_dump(bool enable) {
+    dump_enabled_ = enable;
+  }
+
+  void set_dump_dir(const std::string& dir) {
+    dump_dir_ = dir;
+  }
+
  private:
+  void dump_buffer(
+      const std::string& tag,
+      size_t layer,
+      const float* data,
+      size_t size) const {
+    if (!dump_enabled_) {
+      return;
+    }
+    char filename[512];
+    std::snprintf(
+        filename,
+        sizeof(filename),
+        "%s/%s_layer%zu_pos%zu_step%zu.bin",
+        dump_dir_.c_str(),
+        tag.c_str(),
+        layer,
+        current_pos_,
+        dump_step_);
+    FILE* f = std::fopen(filename, "wb");
+    if (f) {
+      std::fwrite(data, sizeof(float), size, f);
+      std::fclose(f);
+    }
+  }
+
+  void dump_kv_input(const std::string& phase) const {
+    if (!dump_enabled_) {
+      return;
+    }
+    const bool is_prefill = (phase == "prefill");
+    const auto& k_bufs = is_prefill ? prefill_k_input_ : decode_k_input_;
+    const auto& v_bufs = is_prefill ? prefill_v_input_ : decode_v_input_;
+    for (size_t l = 0; l < config_.n_layers; l++) {
+      dump_buffer(phase + "_k_input", l, k_bufs[l].data(), k_bufs[l].size());
+      dump_buffer(phase + "_v_input", l, v_bufs[l].data(), v_bufs[l].size());
+    }
+  }
+
+  void dump_kv_output(
+      const std::string& phase,
+      const std::vector<runtime::EValue>& model_outputs) const {
+    if (!dump_enabled_) {
+      return;
+    }
+    for (size_t l = 0; l < config_.n_layers; l++) {
+      const auto& k_out = model_outputs[1 + l].toTensor();
+      const auto& v_out =
+          model_outputs[1 + config_.n_layers + l].toTensor();
+      dump_buffer(
+          phase + "_k_output",
+          l,
+          k_out.const_data_ptr<float>(),
+          k_out.numel());
+      dump_buffer(
+          phase + "_v_output",
+          l,
+          v_out.const_data_ptr<float>(),
+          v_out.numel());
+    }
+  }
+
   void allocate_buffers() {
     size_t prefill_in_size = config_.n_kv_heads * prefill_cache_len_ *
         config_.head_dim;
@@ -370,6 +450,10 @@ class RunnerManagedCacheIOManager : public IOManager {
   size_t head_size_;
   size_t current_pos_ = 0;
   bool prefill_done_ = false;
+
+  bool dump_enabled_ = false;
+  mutable size_t dump_step_ = 0;
+  std::string dump_dir_ = "/tmp/kv_cache_dump";
 
   // Per-layer input buffers: [1, n_kv_heads, cache_len, head_dim] flattened
   std::vector<std::vector<float>> prefill_k_input_;
