@@ -85,7 +85,13 @@ DEFINE_string(
 DEFINE_string(
     method_name,
     "forward",
-    "Method name to execute in the model (e.g., 'forward', 'lora_forward').");
+    "Method name to execute in the model (e.g., 'forward', 'decode').");
+
+DEFINE_string(
+    prefill_method_name,
+    "",
+    "Optional separate method name for the prefill phase (e.g., 'kv_forward'). "
+    "When set, a separate runner is used for prefill vs decode.");
 
 // Helper function to parse comma-separated string lists
 std::vector<std::string> parseStringList(const std::string& input) {
@@ -181,7 +187,8 @@ int32_t main(int32_t argc, char** argv) {
 #else
           nullptr,
 #endif
-          FLAGS_method_name);
+          FLAGS_method_name,
+          FLAGS_prefill_method_name);
 
   if (runner == nullptr) {
     ET_LOG(Error, "Failed to create llama runner");

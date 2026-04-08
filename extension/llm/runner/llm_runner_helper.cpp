@@ -184,7 +184,8 @@ std::unique_ptr<TextLLMRunner> create_text_llm_runner(
     std::optional<const std::string> data_path,
     float temperature,
     const std::string& method_name,
-    Module::LoadMode load_mode) {
+    Module::LoadMode load_mode,
+    const std::string& prefill_method_name) {
   if (data_path.has_value()) {
     std::vector<std::string> data_files;
     data_files.push_back(data_path.value());
@@ -195,7 +196,8 @@ std::unique_ptr<TextLLMRunner> create_text_llm_runner(
         temperature,
         nullptr,
         method_name,
-        load_mode);
+        load_mode,
+        prefill_method_name);
   }
   return create_text_llm_runner(
       model_path,
@@ -204,7 +206,8 @@ std::unique_ptr<TextLLMRunner> create_text_llm_runner(
       temperature,
       nullptr,
       method_name,
-      load_mode);
+      load_mode,
+      prefill_method_name);
 }
 
 std::unique_ptr<TextLLMRunner> create_text_llm_runner(
@@ -214,7 +217,8 @@ std::unique_ptr<TextLLMRunner> create_text_llm_runner(
     float temperature,
     std::unique_ptr<::executorch::runtime::EventTracer> event_tracer,
     const std::string& method_name,
-    Module::LoadMode load_mode) {
+    Module::LoadMode load_mode,
+    const std::string& prefill_method_name) {
   // Sanity check tokenizer
   if (!tokenizer || !tokenizer->is_loaded()) {
     ET_LOG(Error, "Tokenizer is null or not loaded");
@@ -246,16 +250,91 @@ std::unique_ptr<TextLLMRunner> create_text_llm_runner(
   // Create IOManager
   std::unique_ptr<IOManager> io_manager = std::make_unique<IOManager>(*module);
 
-  // Create text_decoder_runner
-  ET_LOG(Info, "Using method: %s", method_name.c_str());
+  // When using separate prefill/decode methods, pre-load both with shared
+  // planned memory so they share the same KV cache buffers.
+  std::unique_ptr<TextLLMRunner::SharedMethodMemory> shared_method_memory;
+  if (!prefill_method_name.empty()) {
+    ET_LOG(
+        Info,
+        "Pre-loading methods with shared memory: %s, %s",
+        prefill_method_name.c_str(),
+        method_name.c_str());
+
+    auto prefill_meta = module->method_meta(prefill_method_name);
+    auto decode_meta = module->method_meta(method_name);
+    if (!prefill_meta.ok() || !decode_meta.ok()) {
+      ET_LOG(Error, "Failed to get method metadata for shared memory setup");
+      return nullptr;
+    }
+
+    size_t prefill_bufs = prefill_meta->num_memory_planned_buffers();
+    size_t decode_bufs = decode_meta->num_memory_planned_buffers();
+    size_t num_buffers = std::max(prefill_bufs, decode_bufs);
+
+    shared_method_memory =
+        std::make_unique<TextLLMRunner::SharedMethodMemory>();
+    shared_method_memory->buffers.reserve(num_buffers);
+    shared_method_memory->spans.reserve(num_buffers);
+
+    for (size_t i = 0; i < num_buffers; ++i) {
+      int64_t pf_size =
+          (i < prefill_bufs)
+          ? prefill_meta->memory_planned_buffer_size(i).get()
+          : 0;
+      int64_t dc_size =
+          (i < decode_bufs)
+          ? decode_meta->memory_planned_buffer_size(i).get()
+          : 0;
+      size_t max_size = static_cast<size_t>(std::max(pf_size, dc_size));
+      shared_method_memory->buffers.emplace_back(max_size);
+      shared_method_memory->spans.emplace_back(
+          shared_method_memory->buffers.back().data(), max_size);
+    }
+
+    shared_method_memory->allocator =
+        std::make_unique<::executorch::runtime::HierarchicalAllocator>(
+            ::executorch::runtime::Span<::executorch::runtime::Span<uint8_t>>(
+                shared_method_memory->spans.data(),
+                shared_method_memory->spans.size()));
+
+    auto err = module->load_method(
+        prefill_method_name, shared_method_memory->allocator.get());
+    if (err != Error::Ok) {
+      ET_LOG(Error, "Failed to load prefill method with shared memory");
+      return nullptr;
+    }
+    err = module->load_method(
+        method_name, shared_method_memory->allocator.get());
+    if (err != Error::Ok) {
+      ET_LOG(Error, "Failed to load decode method with shared memory");
+      return nullptr;
+    }
+  }
+
+  // Create text_decoder_runner for token generation
+  ET_LOG(Info, "Using decode method: %s", method_name.c_str());
   auto text_decoder_runner = std::make_unique<TextDecoderRunner>(
       module.get(), io_manager.get(), method_name);
 
+  // Create optional prefill runner when a separate prefill method is specified
+  std::unique_ptr<TextDecoderRunner> text_prefill_runner;
+  TextDecoderRunner* prefill_runner_ptr = text_decoder_runner.get();
+  if (!prefill_method_name.empty()) {
+    ET_LOG(Info, "Using prefill method: %s", prefill_method_name.c_str());
+    text_prefill_runner = std::make_unique<TextDecoderRunner>(
+        module.get(), io_manager.get(), prefill_method_name);
+    prefill_runner_ptr = text_prefill_runner.get();
+  }
+
   // Create text_prefiller
+  // Force parallel prefill when a separate prefill method is specified,
+  // since the dedicated prefill method is exported for batch processing.
+  bool enable_parallel_prefill =
+      !prefill_method_name.empty() || metadata.at(kEnableDynamicShape);
   auto text_prefiller = std::make_unique<TextPrefiller>(
-      text_decoder_runner.get(),
+      prefill_runner_ptr,
       metadata.at(kUseKVCache),
-      metadata.at(kEnableDynamicShape),
+      enable_parallel_prefill,
       metadata.at(kMaxSeqLen));
 
   // Create text_token_generator with stats
@@ -277,7 +356,9 @@ std::unique_ptr<TextLLMRunner> create_text_llm_runner(
       std::move(io_manager),
       std::move(text_token_generator),
       std::move(stats),
-      temperature);
+      temperature,
+      std::move(text_prefill_runner),
+      std::move(shared_method_memory));
 }
 
 std::unique_ptr<MultimodalRunner> create_multimodal_runner(

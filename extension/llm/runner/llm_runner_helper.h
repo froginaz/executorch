@@ -109,7 +109,8 @@ ET_EXPERIMENTAL std::unique_ptr<TextLLMRunner> create_text_llm_runner(
     std::optional<const std::string> data_path,
     float temperature = -1.0f,
     const std::string& method_name = "forward",
-    Module::LoadMode load_mode = Module::LoadMode::MmapUseMlockIgnoreErrors);
+    Module::LoadMode load_mode = Module::LoadMode::MmapUseMlockIgnoreErrors,
+    const std::string& prefill_method_name = "");
 
 /**
  * @brief Creates a TextLLMRunner instance with dependency injection
@@ -129,6 +130,8 @@ ET_EXPERIMENTAL std::unique_ptr<TextLLMRunner> create_text_llm_runner(
  * MmapUseMlockIgnoreErrors which uses mmap to avoid loading the entire
  * model into RAM and attempts to pin pages with mlock for lower inference
  * latency, gracefully falling back to standard mmap if mlock is unavailable.
+ * @param prefill_method_name Optional separate method name for the prefill
+ * phase. When non-empty, a separate TextDecoderRunner is created for prefill.
  * @return std::unique_ptr<TextLLMRunner> Initialized TextLLMRunner instance, or
  * nullptr on failure
  */
@@ -139,7 +142,8 @@ ET_EXPERIMENTAL std::unique_ptr<TextLLMRunner> create_text_llm_runner(
     float temperature = -1.0f,
     std::unique_ptr<::executorch::runtime::EventTracer> event_tracer = nullptr,
     const std::string& method_name = "forward",
-    Module::LoadMode load_mode = Module::LoadMode::MmapUseMlockIgnoreErrors);
+    Module::LoadMode load_mode = Module::LoadMode::MmapUseMlockIgnoreErrors,
+    const std::string& prefill_method_name = "");
 
 /**
  * @brief Creates a MultimodalRunner instance with dependency injection
